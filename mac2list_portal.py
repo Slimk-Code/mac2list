@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-IPTV Portal JSON Extractor v15
-FIXED: C5/D4/E5 batch fetch now derives work list from consolidated categories.
-FIXED: C2/D1/E1 merge with existing data instead of overwriting.
-FIXED: Handle js as list (direct categories) or dict (wrapped in data key).
+IPTV Portal JSON Extractor v16
+Section-based linear flow: only current section expanded.
+Failed steps treated as done — flow continues.
+Auto-resume from temp/ folder.
 """
 
 import requests
@@ -14,8 +14,83 @@ import math
 import time
 import sys
 import threading
+import glob
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# ============================================================
+# SECTIONS & STEPS DEFINITION
+# ============================================================
+
+SECTIONS = {
+    "A": {
+        "title": "Auth, Profile & Account",
+        "items": [
+            ("A1", "type=stb&action=handshake", "Auth token", False),
+            ("A2", "type=stb&action=get_profile", "STB profile (mac,sn)", True),
+            ("B1", "type=account_info&action=get_main_info", "Phone,status,connections", True),
+            ("B2", "type=account_info&action=get_info", "Full account details", True),
+            ("B3", "type=account_info&action=get_tariff_plans", "Subscription plans", True),
+        ]
+    },
+    "C": {
+        "title": "Categories",
+        "items": [
+            ("C2", "type=itv&action=get_genres", "Channel categories", True),
+            ("D1", "type=vod&action=get_categories", "VOD categories", True),
+            ("E1", "type=series&action=get_categories", "Series categories", True),
+        ]
+    },
+    "I": {
+        "title": "Items",
+        "items": [
+            ("C5", "type=itv&action=get_ordered_list", "Channels by genre (all pages)", False),
+            ("D4", "type=vod&action=get_ordered_list", "VOD by category (all pages)", False),
+            ("E5", "type=series&action=get_ordered_list", "Series by category (all pages)", False),
+        ]
+    },
+    "R": {
+        "title": "Resolve Link",
+        "items": [
+            ("C4", "type=itv&action=create_link", "Resolve live stream URL", False),
+            ("D3", "type=vod&action=create_link", "Resolve VOD stream URL", False),
+            ("E3", "type=series&action=get_ordered_list&movie_id=...", "Episodes list", False),
+            ("E4", "type=vod&action=create_link&series=N", "Resolve episode stream URL", False),
+        ]
+    },
+    "F": {
+        "title": "Settings & Unlock",
+        "items": [
+            ("F1", "type=settings&action=get", "Portal settings", True),
+            ("F2", "type=settings&action=get_parental_lock", "Parental lock status", True),
+            ("F3", "type=itv&action=set_parental_lock", "Unlock adult (tests 0000,1234,3333)", False),
+        ]
+    },
+    "G": {
+        "title": "Convert / Status",
+        "items": [
+            ("G1", "generate_json", "Generate/Regenerate consolidated JSON", False),
+        ]
+    },
+}
+
+STEP_PARAMS = {
+    "A2": {"type": "stb", "action": "get_profile", "JsHttpRequest": "1-xml"},
+    "B1": {"type": "account_info", "action": "get_main_info", "JsHttpRequest": "1-xml"},
+    "B2": {"type": "account_info", "action": "get_info", "JsHttpRequest": "1-xml"},
+    "B3": {"type": "account_info", "action": "get_tariff_plans", "JsHttpRequest": "1-xml"},
+    "C2": {"type": "itv", "action": "get_genres", "JsHttpRequest": "1-xml"},
+    "D1": {"type": "vod", "action": "get_categories", "JsHttpRequest": "1-xml"},
+    "E1": {"type": "series", "action": "get_categories", "JsHttpRequest": "1-xml"},
+    "F1": {"type": "settings", "action": "get", "JsHttpRequest": "1-xml"},
+    "F2": {"type": "settings", "action": "get_parental_lock", "JsHttpRequest": "1-xml"},
+}
+
+FLAT_STEPS = []
+for sec_key, sec in SECTIONS.items():
+    for code, desc, info, is_auto in sec["items"]:
+        FLAT_STEPS.append((sec_key, code, desc, info, is_auto))
 
 
 class IPTVPortal:
@@ -274,15 +349,10 @@ def trim_series_item(item):
 
 
 # ============================================================
-# AUTO-APPEND JSON MANAGER — FIXED MERGE + BATCH DERIVE
+# JSON MANAGER
 # ============================================================
 
 class JSONManager:
-    """Manages <portal>_<mac>.json with auto-append/update sections.
-    FIXED: Category updates merge with existing channels/items.
-    FIXED: Batch fetchers derive remaining list from categories array.
-    """
-
     def __init__(self, base_url, mac):
         safe_portal = re.sub(r'[^a-zA-Z0-9]', '_', base_url.rstrip('/').replace('http://', '').replace('https://', ''))
         safe_mac = mac.upper().replace(':', '_')
@@ -301,7 +371,10 @@ class JSONManager:
             "_meta": {
                 "created": datetime.now().isoformat(),
                 "portal": "",
-                "mac": ""
+                "mac": "",
+                "last_step": "",
+                "ignored_steps": [],
+                "done_steps": []
             },
             "profile": {},
             "account": {},
@@ -337,6 +410,39 @@ class JSONManager:
         self.data["_meta"]["portal"] = portal
         self.data["_meta"]["mac"] = mac
         self.save()
+
+    def update_last_step(self, step_code):
+        self.data["_meta"]["last_step"] = step_code
+        self.save()
+
+    def mark_done(self, step_code):
+        done = self.data["_meta"].get("done_steps", [])
+        if step_code not in done:
+            done.append(step_code)
+            self.data["_meta"]["done_steps"] = done
+        self.update_last_step(step_code)
+
+    def mark_ignored(self, step_code):
+        ignored = self.data["_meta"].get("ignored_steps", [])
+        if step_code not in ignored:
+            ignored.append(step_code)
+            self.data["_meta"]["ignored_steps"] = ignored
+        self.update_last_step(step_code)
+
+    def is_done(self, step_code):
+        return step_code in self.data["_meta"].get("done_steps", [])
+
+    def is_ignored(self, step_code):
+        return step_code in self.data["_meta"].get("ignored_steps", [])
+
+    def get_resume_index(self):
+        last = self.data["_meta"].get("last_step", "")
+        if not last:
+            return 0
+        for i, (_, code, _, _, _) in enumerate(FLAT_STEPS):
+            if code == last:
+                return i + 1
+        return 0
 
     def update_profile(self, profile_data):
         self.data["profile"] = profile_data
@@ -592,139 +698,11 @@ class JSONManager:
 
 
 # ============================================================
-# MENU DEFINITIONS
+# UTILITY FUNCTIONS
 # ============================================================
-
-MENU = {
-    "A": {
-        "title": "Auth, Profile & Account",
-        "items": [
-            ("A1", "type=stb&action=handshake", {"type": "stb", "action": "handshake", "JsHttpRequest": "1-xml"}, "Get auth token"),
-            ("A2", "type=stb&action=get_profile", {"type": "stb", "action": "get_profile", "JsHttpRequest": "1-xml"}, "STB profile (mac,sn)"),
-            ("B1", "type=account_info&action=get_main_info", {"type": "account_info", "action": "get_main_info", "JsHttpRequest": "1-xml"}, "Phone,status,connections"),
-            ("B2", "type=account_info&action=get_info", {"type": "account_info", "action": "get_info", "JsHttpRequest": "1-xml"}, "Full account details"),
-            ("B3", "type=account_info&action=get_tariff_plans", {"type": "account_info", "action": "get_tariff_plans", "JsHttpRequest": "1-xml"}, "Subscription plans"),
-        ]
-    },
-    "C": {
-        "title": "Categories",
-        "items": [
-            ("C2", "type=itv&action=get_genres", {"type": "itv", "action": "get_genres", "JsHttpRequest": "1-xml"}, "Channel categories"),
-            ("D1", "type=vod&action=get_categories", {"type": "vod", "action": "get_categories", "JsHttpRequest": "1-xml"}, "VOD categories"),
-            ("E1", "type=series&action=get_categories", {"type": "series", "action": "get_categories", "JsHttpRequest": "1-xml"}, "Series categories"),
-        ]
-    },
-    "I": {
-        "title": "Items",
-        "items": [
-            ("C3", "type=itv&action=get_ordered_list", None, "Channels by genre (manual)"),
-            ("D2", "type=vod&action=get_ordered_list", None, "VOD by category (manual)"),
-            ("E2", "type=series&action=get_ordered_list", None, "Series by category (manual)"),
-            ("C5", "batch_fetch_live", None, "BATCH: Fetch remaining live genres"),
-            ("D4", "batch_fetch_movies", None, "BATCH: Fetch remaining movie categories"),
-            ("E5", "batch_fetch_series", None, "BATCH: Fetch remaining series categories"),
-            ("C6", "view_live_categories", None, "VIEW: Live category list"),
-            ("D5", "view_movie_categories", None, "VIEW: Movie category list"),
-            ("E6", "view_series_categories", None, "VIEW: Series category list"),
-        ]
-    },
-    "R": {
-        "title": "Resolve Link",
-        "items": [
-            ("C4", "type=itv&action=create_link (needs cmd)", None, "Resolve live stream URL"),
-            ("D3", "type=vod&action=create_link (needs cmd)", None, "Resolve VOD stream URL"),
-            ("E3", "type=series&action=get_ordered_list&movie_id=...", None, "Episodes list"),
-            ("E4", "type=vod&action=create_link&series=N (needs cmd)", None, "Resolve episode stream URL"),
-        ]
-    },
-    "F": {
-        "title": "Settings & Unlock",
-        "items": [
-            ("F1", "type=settings&action=get", {"type": "settings", "action": "get", "JsHttpRequest": "1-xml"}, "Portal settings"),
-            ("F2", "type=settings&action=get_parental_lock", {"type": "settings", "action": "get_parental_lock", "JsHttpRequest": "1-xml"}, "Parental lock status"),
-            ("F3", "type=itv&action=set_parental_lock", None, "Unlock adult (tests 0000,1234,3333)"),
-        ]
-    },
-    "G": {
-        "title": "Convert / Status",
-        "items": [
-            ("G1", "generate_json", None, "Generate/Regenerate consolidated JSON"),
-        ]
-    },
-}
-
-G_CHECKLIST = [
-    ("A2", "Account profile"),
-    ("B1", "Billing info"),
-    ("C2", "Live categories"),
-    ("C3", "Live channels"),
-    ("D1", "Movie categories"),
-    ("D2", "Movie items"),
-    ("E1", "Series categories"),
-    ("E2", "Series items"),
-    ("E3", "Episodes"),
-]
-
-AUTO_FETCH = {
-    "A": ["A2", "B1"],
-}
-
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
-
-
-def print_menu(done_map, fail_200_map, fail_other_map, expanded_cat=None):
-    clear_screen()
-    print("=" * 60)
-    print("   API ACTION MENU")
-    print("   Type letter to expand, code to fetch, 'done' to finish")
-    print("=" * 60)
-    for cat_key, cat in MENU.items():
-        is_expanded = (cat_key == expanded_cat)
-        print("\n  {} — {}".format(cat_key, cat['title']))
-        if is_expanded:
-            for code, desc, params, info in cat["items"]:
-                if fail_200_map.get(code, False):
-                    mark = "[-]"
-                elif fail_other_map.get(code, False):
-                    mark = "[!]"
-                elif done_map.get(code, False):
-                    mark = "[x]"
-                else:
-                    mark = "[ ]"
-                if code[0] != cat_key:
-                    num = code
-                else:
-                    num = code[1:]
-                print("    {} {:<5}  {}  → {}".format(mark, num, desc, info))
-    print("\n" + "-" * 60)
-
-
-def print_g_status(done_map, json_mgr):
-    clear_screen()
-    print("=" * 60)
-    print("   G — CONVERT / STATUS")
-    print("=" * 60)
-    print("\n  Checklist of required items:")
-    print()
-    all_done = True
-    for code, label in G_CHECKLIST:
-        if done_map.get(code, False):
-            mark = "[x]"
-        else:
-            mark = "[ ]"
-            all_done = False
-        print("    {}  {}  {}".format(mark, code, label))
-    print()
-    print("-" * 60)
-    if all_done:
-        print("\n  [OK] All required items present!")
-        print("  Type G1 to generate the consolidated JSON file.")
-    else:
-        print("\n  [!] Missing items — fetch all above before generating.")
-    print()
-    return all_done
 
 
 def save_json(data, code, action_name):
@@ -796,66 +774,12 @@ def handle_fetch_result(result, code, safe_name):
         return fname, "error", True, is_200
 
 
-def do_auto_fetch(client, code, flat_items, done_map, fail_200_map, fail_other_map, json_mgr):
-    desc, params, info = flat_items[code]
-    if params is None:
-        return False
-
-    result = client.fetch(params)
-    safe_name = desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
-    fname, status_str, is_error, is_200 = handle_fetch_result(result, code, safe_name)
-
-    if is_error:
-        if is_200:
-            fail_200_map[code] = True
-        else:
-            fail_other_map[code] = True
-        return False
-
-    data = result.get("_data")
-    if data and isinstance(data, dict):
-        js = data.get("js", {})
-
-        if code == "A2":
-            json_mgr.update_profile(js)
-        elif code == "B1":
-            json_mgr.update_account(js)
-        elif code == "C2":
-            if isinstance(js, list):
-                cats = js
-            elif isinstance(js, dict):
-                cats = js.get("data", [])
-            else:
-                cats = []
-            json_mgr.update_live_categories(cats)
-        elif code == "D1":
-            if isinstance(js, list):
-                cats = js
-            elif isinstance(js, dict):
-                cats = js.get("data", [])
-            else:
-                cats = []
-            json_mgr.update_movie_categories(cats)
-        elif code == "E1":
-            if isinstance(js, list):
-                cats = js
-            elif isinstance(js, dict):
-                cats = js.get("data", [])
-            else:
-                cats = []
-            json_mgr.update_series_categories(cats)
-
-    done_map[code] = True
-    return True
-
-
 # ============================================================
-# CATEGORY PROBING
+# PROBING
 # ============================================================
 
-def probe_categories(client, json_mgr, section, done_map, fail_200_map, fail_other_map):
+def probe_categories(client, json_mgr, section):
     if section == "live":
-        code = "C2"
         cats = json_mgr.data["live"].get("categories", [])
         action_type = "itv"
         action = "get_ordered_list"
@@ -863,7 +787,6 @@ def probe_categories(client, json_mgr, section, done_map, fail_200_map, fail_oth
         mark_fn = json_mgr.mark_live_genre_probed
         grand_fn = json_mgr.set_live_grand_total
     elif section == "movies":
-        code = "D1"
         cats = json_mgr.data["movies"].get("categories", [])
         action_type = "vod"
         action = "get_ordered_list"
@@ -871,7 +794,6 @@ def probe_categories(client, json_mgr, section, done_map, fail_200_map, fail_oth
         mark_fn = json_mgr.mark_movie_category_probed
         grand_fn = json_mgr.set_movie_grand_total
     elif section == "series":
-        code = "E1"
         cats = json_mgr.data["series"].get("categories", [])
         action_type = "series"
         action = "get_ordered_list"
@@ -945,194 +867,10 @@ def probe_categories(client, json_mgr, section, done_map, fail_200_map, fail_oth
 
 
 # ============================================================
-# PAGINATED CATEGORY VIEWER
+# BATCH FETCH
 # ============================================================
 
-def paginated_viewer(client, json_mgr, section, done_map, fail_200_map, fail_other_map):
-    if section == "live":
-        cats = json_mgr.data["live"].get("categories", [])
-        fetched_list = json_mgr.get_live_fetched()
-        failed_list = json_mgr.get_live_failed()
-        action_type = "itv"
-        action = "get_ordered_list"
-        id_key = "genre"
-        update_fn = json_mgr.update_live_channels
-        fail_fn = json_mgr.mark_live_genre_failed
-        code = "C3"
-    elif section == "movies":
-        cats = json_mgr.data["movies"].get("categories", [])
-        fetched_list = json_mgr.get_movie_fetched()
-        failed_list = json_mgr.get_movie_failed()
-        action_type = "vod"
-        action = "get_ordered_list"
-        id_key = "category"
-        update_fn = json_mgr.update_movie_items
-        fail_fn = json_mgr.mark_movie_category_failed
-        code = "D2"
-    elif section == "series":
-        cats = json_mgr.data["series"].get("categories", [])
-        fetched_list = json_mgr.get_series_fetched()
-        failed_list = json_mgr.get_series_failed()
-        action_type = "series"
-        action = "get_ordered_list"
-        id_key = "category"
-        update_fn = json_mgr.update_series_items
-        fail_fn = json_mgr.mark_series_category_failed
-        code = "E2"
-    else:
-        return
-
-    sorted_cats = []
-    wildcard = None
-    normal_cats = []
-    for cat in cats:
-        if str(cat.get("id")) == "*":
-            wildcard = cat
-        else:
-            normal_cats.append(cat)
-
-    normal_cats.sort(key=lambda x: x.get("total_items", 0), reverse=True)
-    if wildcard:
-        sorted_cats = [wildcard] + normal_cats
-    else:
-        sorted_cats = normal_cats
-
-    page_size = 50
-    total_cats = len(sorted_cats)
-    current_page = 1
-    total_pages = math.ceil(total_cats / page_size) if total_cats else 1
-    filter_mode = "all"
-
-    while True:
-        if filter_mode == "remaining":
-            display_cats = [c for c in sorted_cats if str(c.get("id")) not in fetched_list and str(c.get("id")) not in failed_list]
-        elif filter_mode == "fetched":
-            display_cats = [c for c in sorted_cats if str(c.get("id")) in fetched_list]
-        elif filter_mode == "failed":
-            display_cats = [c for c in sorted_cats if str(c.get("id")) in failed_list]
-        else:
-            display_cats = sorted_cats
-
-        total_display = len(display_cats)
-        total_pages = math.ceil(total_display / page_size) if total_display else 1
-        if current_page > total_pages:
-            current_page = total_pages if total_pages > 0 else 1
-
-        start_idx = (current_page - 1) * page_size
-        end_idx = min(start_idx + page_size, total_display)
-        page_cats = display_cats[start_idx:end_idx]
-
-        clear_screen()
-        title_map = {"live": "LIVE TV", "movies": "MOVIES", "series": "SERIES"}
-        print("=" * 70)
-        print("   {} CATEGORIES (Page {}/{}) — Filter: {}".format(title_map.get(section, section.upper()), current_page, total_pages, filter_mode))
-        print("=" * 70)
-        print("  [#]  ID      TITLE                  ITEMS   STATUS")
-        print("  " + "-" * 64)
-
-        for i, cat in enumerate(page_cats, 1):
-            cat_id = str(cat.get("id", ""))
-            title = cat.get("title", "Unknown")[:22]
-            items = cat.get("total_items", 0)
-            if cat_id == "*":
-                status = "-"
-            elif cat_id in fetched_list:
-                status = "[x]"
-            elif cat_id in failed_list:
-                status = "[!]"
-            else:
-                status = "[ ]"
-            print("  [{:<2}] {:<6} {:<22} {:<6} {}".format(i, cat_id, title, items, status))
-
-        print("  " + "-" * 64)
-        print("  Total: {} | Page {} of {} | {} shown".format(total_display, current_page, total_pages, len(page_cats)))
-        print("  n=next  p=prev  j=jump  f=filter  b=back")
-        print("  Or type row number [1-{}] to fetch that category".format(len(page_cats)))
-
-        choice = input("\n  > ").strip().lower()
-
-        if choice == "b":
-            break
-        elif choice == "n":
-            if current_page < total_pages:
-                current_page += 1
-        elif choice == "p":
-            if current_page > 1:
-                current_page -= 1
-        elif choice == "j":
-            pg = input("  Jump to page: ").strip()
-            try:
-                pg_num = int(pg)
-                if 1 <= pg_num <= total_pages:
-                    current_page = pg_num
-            except:
-                pass
-        elif choice == "f":
-            print("  Filter: [a]ll  [r]emaining  [f]etched  [e]rror/failed")
-            fchoice = input("  > ").strip().lower()
-            if fchoice == "a":
-                filter_mode = "all"
-            elif fchoice == "r":
-                filter_mode = "remaining"
-            elif fchoice == "f":
-                filter_mode = "fetched"
-            elif fchoice == "e":
-                filter_mode = "failed"
-            current_page = 1
-        else:
-            try:
-                row_num = int(choice)
-                if 1 <= row_num <= len(page_cats):
-                    selected = page_cats[row_num - 1]
-                    cat_id = str(selected.get("id", ""))
-                    cat_title = selected.get("title", "Unknown")
-
-                    if cat_id == "*":
-                        print("\n  [!] Cannot fetch wildcard '*' category individually.")
-                        input("  Press Enter to continue...")
-                        continue
-
-                    if cat_id in fetched_list:
-                        print("\n  [!] Category {} already fetched.".format(cat_id))
-                        input("  Press Enter to continue...")
-                        continue
-
-                    print("\n  Fetching category {} ({}) — all pages...".format(cat_id, cat_title))
-                    params = {
-                        "type": action_type,
-                        "action": action,
-                        id_key: cat_id,
-                        "p": "1",
-                        "JsHttpRequest": "1-xml"
-                    }
-                    result = client.fetch_all_pages(params)
-                    data = result.get("_data")
-
-                    if data and isinstance(data, dict):
-                        js = data.get("js", {})
-                        if isinstance(js, dict):
-                            items = js.get("data", [])
-                            total_items = js.get("total_items", len(items))
-                            update_fn(cat_id, items, total_items)
-                            print("  -> [OK] Fetched {} items.".format(total_items))
-                            done_map[code] = True
-                        else:
-                            fail_fn(cat_id)
-                            print("  -> [!] Failed to fetch.")
-                    else:
-                        fail_fn(cat_id)
-                        print("  -> [!] Failed to fetch.")
-
-                    input("  Press Enter to continue...")
-            except ValueError:
-                pass
-
-
-# ============================================================
-# BATCH FETCH — FIXED: derive remaining from categories array
-# ============================================================
-
-def batch_fetch_live(client, json_mgr, done_map, fail_200_map, fail_other_map):
+def batch_fetch_live(client, json_mgr):
     cats = json_mgr.data["live"].get("categories", [])
     fetched = set(json_mgr.get_live_fetched())
     failed = set(json_mgr.get_live_failed())
@@ -1142,7 +880,7 @@ def batch_fetch_live(client, json_mgr, done_map, fail_200_map, fail_other_map):
 
     if not remaining:
         print("\n  [OK] Nothing left to fetch. {} done, {} failed.".format(len(fetched), len(failed)))
-        return
+        return True
 
     print("\n  Live Batch Fetch")
     print("  Total genres: {} | Remaining: {} | Fetched: {} | Failed: {}".format(len(all_ids), len(remaining), len(fetched), len(failed)))
@@ -1156,10 +894,10 @@ def batch_fetch_live(client, json_mgr, done_map, fail_200_map, fail_other_map):
             to_fetch = remaining[:n]
         except:
             print("  [!] Invalid input.")
-            return
+            return True  # treat as done, continue flow
 
     if not to_fetch:
-        return
+        return True
 
     print("\n  Fetching {} genres (all pages each)...".format(len(to_fetch)))
     done_count = 0
@@ -1190,10 +928,10 @@ def batch_fetch_live(client, json_mgr, done_map, fail_200_map, fail_other_map):
 
     print()
     print("  -> [OK] Batch complete. {} fetched, {} failed.".format(done_count, fail_count))
-    done_map["C3"] = True
+    return True
 
 
-def batch_fetch_movies(client, json_mgr, done_map, fail_200_map, fail_other_map):
+def batch_fetch_movies(client, json_mgr):
     cats = json_mgr.data["movies"].get("categories", [])
     fetched = set(json_mgr.get_movie_fetched())
     failed = set(json_mgr.get_movie_failed())
@@ -1203,7 +941,7 @@ def batch_fetch_movies(client, json_mgr, done_map, fail_200_map, fail_other_map)
 
     if not remaining:
         print("\n  [OK] Nothing left to fetch. {} done, {} failed.".format(len(fetched), len(failed)))
-        return
+        return True
 
     print("\n  Movie Batch Fetch")
     print("  Total categories: {} | Remaining: {} | Fetched: {} | Failed: {}".format(len(all_ids), len(remaining), len(fetched), len(failed)))
@@ -1217,10 +955,10 @@ def batch_fetch_movies(client, json_mgr, done_map, fail_200_map, fail_other_map)
             to_fetch = remaining[:n]
         except:
             print("  [!] Invalid input.")
-            return
+            return True
 
     if not to_fetch:
-        return
+        return True
 
     print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
     done_count = 0
@@ -1251,10 +989,10 @@ def batch_fetch_movies(client, json_mgr, done_map, fail_200_map, fail_other_map)
 
     print()
     print("  -> [OK] Batch complete. {} fetched, {} failed.".format(done_count, fail_count))
-    done_map["D2"] = True
+    return True
 
 
-def batch_fetch_series(client, json_mgr, done_map, fail_200_map, fail_other_map):
+def batch_fetch_series(client, json_mgr):
     cats = json_mgr.data["series"].get("categories", [])
     fetched = set(json_mgr.get_series_fetched())
     failed = set(json_mgr.get_series_failed())
@@ -1264,7 +1002,7 @@ def batch_fetch_series(client, json_mgr, done_map, fail_200_map, fail_other_map)
 
     if not remaining:
         print("\n  [OK] Nothing left to fetch. {} done, {} failed.".format(len(fetched), len(failed)))
-        return
+        return True
 
     print("\n  Series Batch Fetch")
     print("  Total categories: {} | Remaining: {} | Fetched: {} | Failed: {}".format(len(all_ids), len(remaining), len(fetched), len(failed)))
@@ -1278,10 +1016,10 @@ def batch_fetch_series(client, json_mgr, done_map, fail_200_map, fail_other_map)
             to_fetch = remaining[:n]
         except:
             print("  [!] Invalid input.")
-            return
+            return True
 
     if not to_fetch:
-        return
+        return True
 
     print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
     done_count = 0
@@ -1312,7 +1050,297 @@ def batch_fetch_series(client, json_mgr, done_map, fail_200_map, fail_other_map)
 
     print()
     print("  -> [OK] Batch complete. {} fetched, {} failed.".format(done_count, fail_count))
-    done_map["E2"] = True
+    return True
+
+
+# ============================================================
+# DISPLAY — collapsed sections except current
+# ============================================================
+
+def print_section_status(current_step_idx, json_mgr):
+    clear_screen()
+    print("=" * 60)
+    print("   IPTV Portal JSON Extractor v16 — Linear Flow")
+    print("=" * 60)
+    print()
+
+    flat_idx = 0
+    for sec_key, sec in SECTIONS.items():
+        # Check if any step in this section is the current one
+        section_steps = [flat_idx + j for j in range(len(sec["items"]))]
+        is_current_section = current_step_idx in section_steps
+
+        # Count done/ignored in this section
+        done_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
+        ignored_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_ignored(code))
+        total_count = len(sec["items"])
+
+        if is_current_section:
+            print("  ▼ {} — {}  ({}/{} done)".format(sec_key, sec['title'], done_count, total_count))
+            for code, desc, info, _ in sec["items"]:
+                if json_mgr.is_done(code):
+                    mark = "[x]"
+                elif json_mgr.is_ignored(code):
+                    mark = "[I]"
+                elif flat_idx == current_step_idx:
+                    mark = "[→]"
+                else:
+                    mark = "[ ]"
+                print("    {} {:<4}  {:<45} {}".format(mark, code, desc, info))
+                flat_idx += 1
+        else:
+            status = ""
+            if done_count == total_count:
+                status = " [all done]"
+            elif done_count > 0 or ignored_count > 0:
+                status = " [{}/{} done]".format(done_count, total_count)
+            print("  ▶ {} — {}{}".format(sec_key, sec['title'], status))
+            flat_idx += len(sec["items"])
+        print()
+
+    print("-" * 60)
+
+
+def prompt_continue(step_code, step_info):
+    print("\n  [{}] {}".format(step_code, step_info))
+    print("  Press Enter to continue or [I]gnore to skip...")
+    choice = input("  > ").strip().upper()
+    return choice == "I"
+
+
+# ============================================================
+# STEP EXECUTORS
+# ============================================================
+
+def run_auto_fetch_step(client, json_mgr, step_code, step_desc):
+    params = STEP_PARAMS.get(step_code)
+    if not params:
+        return False
+
+    result = client.fetch(params)
+    safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
+    fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
+
+    if is_error:
+        print("  -> [!] Failed — saved error to {}".format(fname))
+        return False
+
+    print("  -> [OK] Saved to {}".format(fname))
+
+    data = result.get("_data")
+    if data and isinstance(data, dict):
+        js = data.get("js", {})
+
+        if step_code == "A2":
+            json_mgr.update_profile(js)
+        elif step_code == "B1":
+            json_mgr.update_account(js)
+        elif step_code == "C2":
+            if isinstance(js, list):
+                cats = js
+            elif isinstance(js, dict):
+                cats = js.get("data", [])
+            else:
+                cats = []
+            json_mgr.update_live_categories(cats)
+            probe_categories(client, json_mgr, "live")
+        elif step_code == "D1":
+            if isinstance(js, list):
+                cats = js
+            elif isinstance(js, dict):
+                cats = js.get("data", [])
+            else:
+                cats = []
+            json_mgr.update_movie_categories(cats)
+            probe_categories(client, json_mgr, "movies")
+        elif step_code == "E1":
+            if isinstance(js, list):
+                cats = js
+            elif isinstance(js, dict):
+                cats = js.get("data", [])
+            else:
+                cats = []
+            json_mgr.update_series_categories(cats)
+            probe_categories(client, json_mgr, "series")
+        elif step_code == "F1":
+            pass
+        elif step_code == "F2":
+            pass
+
+    return True
+
+
+def run_batch_step(client, json_mgr, step_code):
+    if step_code == "C5":
+        return batch_fetch_live(client, json_mgr)
+    elif step_code == "D4":
+        return batch_fetch_movies(client, json_mgr)
+    elif step_code == "E5":
+        return batch_fetch_series(client, json_mgr)
+    return True
+
+
+def run_resolve_step(client, json_mgr, step_code, step_desc):
+    if step_code == "C4":
+        cmd = input("  Enter cmd value for live create_link: ").strip()
+        if not cmd:
+            print("  -> Skipped — no cmd provided.")
+            return True  # treat as done, continue
+        params = {"type": "itv", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
+
+    elif step_code == "D3":
+        cmd = input("  Enter cmd value for VOD create_link: ").strip()
+        if not cmd:
+            print("  -> Skipped — no cmd provided.")
+            return True
+        params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
+
+    elif step_code == "E3":
+        sid = input("  Enter series_id (movie_id) for episode list: ").strip()
+        if not sid:
+            print("  -> Skipped — no series_id provided.")
+            return True
+        params = {"type": "series", "action": "get_ordered_list", "movie_id": sid, "season_id": "0", "episode_id": "0", "row": "0", "JsHttpRequest": "1-xml"}
+
+    elif step_code == "E4":
+        cmd = input("  Enter cmd value for episode create_link: ").strip()
+        ep_num = input("  Enter episode number: ").strip() or "1"
+        if not cmd:
+            print("  -> Skipped — no cmd provided.")
+            return True
+        params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": ep_num, "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
+
+    else:
+        return True
+
+    result = client.fetch(params)
+    safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
+    fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
+
+    if is_error:
+        print("  -> [!] Failed — saved error to {}".format(fname))
+        return True  # treat as done, continue flow
+
+    print("  -> [OK] Saved to {}".format(fname))
+
+    if step_code == "E3":
+        data = result.get("_data")
+        if data and isinstance(data, dict):
+            js = data.get("js", {})
+            if isinstance(js, list):
+                items = js
+            elif isinstance(js, dict):
+                items = js.get("data", [])
+            else:
+                items = []
+            sid = params.get("movie_id", "")
+            seasons_map = {}
+            for ep in items:
+                season_id = ep.get("season_id", "0")
+                if season_id not in seasons_map:
+                    seasons_map[season_id] = {
+                        "season_id": season_id,
+                        "name": ep.get("season_name", "Season " + str(season_id)),
+                        "episodes": [],
+                        "cmd": ep.get("cmd", "")
+                    }
+                seasons_map[season_id]["episodes"].append(ep.get("episode_num", ep.get("number", 0)))
+            seasons = list(seasons_map.values())
+            json_mgr.update_series_episodes(sid, seasons)
+
+    return True
+
+
+def run_f3_step(client, json_mgr):
+    pins = ["0000", "1234", "3333"]
+    unlocked = False
+    for pin in pins:
+        print("\n  Trying PIN {} ...".format(pin))
+        params = {"type": "itv", "action": "set_parental_lock", "password": pin, "JsHttpRequest": "1-xml"}
+        result = client.fetch(params)
+        data = result.get("_data")
+        if data:
+            js = data.get('js', {}) if isinstance(data, dict) else {}
+            if js is True or (isinstance(js, dict) and js.get('result') in (True, 'true', 1)):
+                print("  -> [OK] Unlocked with PIN {}!".format(pin))
+                unlocked = True
+                break
+
+    if unlocked:
+        safe_name = "type_itv_action_set_parental_lock_UNLOCKED"
+        fname = save_json(data, "F3", safe_name)
+        print("  -> Saved to {}".format(fname))
+        return True
+    else:
+        print("  -> [-] All PINs failed (0000, 1234, 3333)")
+        error_data = {
+            "_error": True,
+            "_timestamp": datetime.now().isoformat(),
+            "_action": "type=itv&action=set_parental_lock",
+            "_reason": "All PIN combinations failed (0000, 1234, 3333). Portal may require a different PIN or parental lock is already disabled.",
+            "_tried_pins": pins,
+            "_lockedpath": result.get("_lockedpath", [])
+        }
+        safe_name = "type_itv_action_set_parental_lock_ERROR"
+        filename = "temp/F3_{}.json".format(safe_name)
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(error_data, f, indent=2, ensure_ascii=False)
+        print("  -> Saved error to {}".format(filename))
+        return True  # treat as done, continue flow
+
+
+# ============================================================
+# RESUME / STARTUP
+# ============================================================
+
+def scan_existing_sessions():
+    os.makedirs("temp", exist_ok=True)
+    files = glob.glob("temp/*_*.json")
+    sessions = []
+    for f in files:
+        basename = os.path.basename(f)
+        if re.match(r'^[A-Z]\d+_', basename):
+            continue
+        try:
+            with open(f, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+            meta = data.get("_meta", {})
+            portal = meta.get("portal", "unknown")
+            mac = meta.get("mac", "unknown")
+            last_step = meta.get("last_step", "")
+            done = meta.get("done_steps", [])
+            ignored = meta.get("ignored_steps", [])
+            sessions.append({
+                "file": f,
+                "portal": portal,
+                "mac": mac,
+                "last_step": last_step,
+                "done_count": len(done),
+                "ignored_count": len(ignored)
+            })
+        except:
+            pass
+    return sessions
+
+
+def show_resume_menu(sessions):
+    clear_screen()
+    print("=" * 60)
+    print("   IPTV Portal JSON Extractor v16")
+    print("=" * 60)
+    print("\n  Existing sessions found:")
+    print()
+    for i, s in enumerate(sessions, 1):
+        status = "{} done, {} ignored".format(s["done_count"], s["ignored_count"])
+        if s["last_step"]:
+            status += " | last: {}".format(s["last_step"])
+        print("  [{}] {} | {}".format(i, s["portal"], s["mac"]))
+        print("      {}".format(status))
+    print()
+    print("  [N] Start new session")
+    print()
+    choice = input("  Select: ").strip().upper()
+    return choice
 
 
 # ============================================================
@@ -1320,27 +1348,58 @@ def batch_fetch_series(client, json_mgr, done_map, fail_200_map, fail_other_map)
 # ============================================================
 
 def main():
-    print("=" * 60)
-    print("   IPTV Portal JSON Extractor v15 — portal.php")
-    print("=" * 60)
+    sessions = scan_existing_sessions()
 
-    portal = input("\nPortal URL (e.g., http://example.com or http://ip:port): ").strip()
-    mac = input("MAC Address (e.g., 00:1A:79:XX:XX:XX): ").strip()
+    portal = None
+    mac = None
+    json_mgr = None
+    resume_idx = 0
+
+    if sessions:
+        choice = show_resume_menu(sessions)
+        if choice == "N":
+            pass
+        else:
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(sessions):
+                    session = sessions[idx]
+                    with open(session["file"], 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    portal = data["_meta"].get("portal", "")
+                    mac = data["_meta"].get("mac", "")
+                    json_mgr = JSONManager(portal, mac)
+                    json_mgr.data = data
+                    resume_idx = json_mgr.get_resume_index()
+                    print("\n  [OK] Resuming session: {} | {}".format(portal, mac))
+                    print("  Last step: {}".format(data["_meta"].get("last_step", "none")))
+                    input("  Press Enter to continue...")
+            except:
+                pass
 
     if not portal or not mac:
-        print("[!] Both portal URL and MAC address are required.")
-        return
+        clear_screen()
+        print("=" * 60)
+        print("   IPTV Portal JSON Extractor v16 — New Session")
+        print("=" * 60)
+        portal = input("\nPortal URL (e.g., http://example.com or http://ip:port): ").strip()
+        mac = input("MAC Address (e.g., 00:1A:79:XX:XX:XX): ").strip()
 
-    if not re.match(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$', mac):
-        print("[!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
-        return
+        if not portal or not mac:
+            print("[!] Both portal URL and MAC address are required.")
+            return
 
-    os.makedirs("temp", exist_ok=True)
+        if not re.match(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$', mac):
+            print("[!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
+            return
+
+        os.makedirs("temp", exist_ok=True)
+        json_mgr = JSONManager(portal, mac)
+        json_mgr.set_meta(portal, mac)
 
     client = IPTVPortal(portal, mac)
-    json_mgr = JSONManager(portal, mac)
-    json_mgr.set_meta(portal, mac)
 
+    # Handshake always runs
     print("\n[Handshake] Using: {}".format(client.locked_url))
     handshake_result = client.handshake()
     handshake_data = handshake_result.get("_data")
@@ -1359,334 +1418,60 @@ def main():
         return
 
     print("  [OK] Token received.")
-
     save_json(handshake_data, "A1", "handshake")
     print("  -> Saved to temp/A1_handshake.json")
+    json_mgr.mark_done("A1")
 
-    done_map = {"A1": True}
-    fail_200_map = {}
-    fail_other_map = {}
-    expanded_cat = "A"
-
-    flat_items = {}
-    for cat_key, cat in MENU.items():
-        for code, desc, params, info in cat["items"]:
-            flat_items[code] = (desc, params, info)
-
-    print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-
-    while True:
-        choice = input("\nEnter letter/code (or 'done' / 'list'): ").strip().upper()
-
-        if choice in ("DONE", "EXIT", "QUIT"):
-            break
-
-        if choice == "LIST":
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
+    # Linear flow through all sections
+    for i, (sec_key, code, desc, info, is_auto) in enumerate(FLAT_STEPS):
+        if i == 0:  # A1 already done above
             continue
 
-        if choice == "G":
-            print_g_status(done_map, json_mgr)
+        if i < resume_idx:
             continue
 
-        if choice == "G1":
-            all_done = print_g_status(done_map, json_mgr)
-            if all_done:
-                fname = json_mgr.save()
-                print("\n  [OK] Consolidated JSON generated: {}".format(fname))
-            else:
-                print("\n  [!] Cannot generate — missing required items.")
+        print_section_status(i, json_mgr)
+
+        if json_mgr.is_done(code) or json_mgr.is_ignored(code):
             continue
 
-        if choice in MENU and len(choice) == 1:
-            auto_codes = AUTO_FETCH.get(choice, [])
-            if isinstance(auto_codes, str):
-                auto_codes = [auto_codes]
+        ignored = prompt_continue(code, info)
 
-            for auto_code in auto_codes:
-                if auto_code and not done_map.get(auto_code, False) and not fail_200_map.get(auto_code, False) and not fail_other_map.get(auto_code, False):
-                    print("\n  [Auto-fetch] {} ...".format(auto_code))
-                    ok = do_auto_fetch(client, auto_code, flat_items, done_map, fail_200_map, fail_other_map, json_mgr)
-                    if ok:
-                        print("  -> [OK] {} fetched and appended.".format(auto_code))
-                    else:
-                        print("  -> [!] {} auto-fetch failed.".format(auto_code))
-
-            for auto_code in auto_codes:
-                if done_map.get(auto_code, False):
-                    if auto_code == "C2":
-                        probe_categories(client, json_mgr, "live", done_map, fail_200_map, fail_other_map)
-                    elif auto_code == "D1":
-                        probe_categories(client, json_mgr, "movies", done_map, fail_200_map, fail_other_map)
-                    elif auto_code == "E1":
-                        probe_categories(client, json_mgr, "series", done_map, fail_200_map, fail_other_map)
-
-            expanded_cat = choice
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
+        if ignored:
+            json_mgr.mark_ignored(code)
+            print("  -> Ignored.")
+            input("  Press Enter to continue to next step...")
             continue
 
-        if choice.isdigit():
-            full_code = expanded_cat + choice
-            if full_code not in flat_items:
-                print("[!] {} does not exist in {}.".format(full_code, expanded_cat))
-                continue
-            choice = full_code
-        elif choice not in flat_items:
-            print("[!] Unknown: {}. Type a letter (A,C,I,R,F,G) to expand, or a code.".format(choice))
-            continue
+        success = False
 
-        if done_map.get(choice, False) or fail_200_map.get(choice, False) or fail_other_map.get(choice, False):
-            print("[!] {} already tried.".format(choice))
-            continue
+        if is_auto:
+            success = run_auto_fetch_step(client, json_mgr, code, desc)
+        elif code in ("C5", "D4", "E5"):
+            success = run_batch_step(client, json_mgr, code)
+        elif code in ("C4", "D3", "E3", "E4"):
+            success = run_resolve_step(client, json_mgr, code, desc)
+        elif code == "F3":
+            success = run_f3_step(client, json_mgr)
+        elif code == "G1":
+            fname = json_mgr.save()
+            print("  -> [OK] Consolidated JSON saved to {}".format(fname))
+            success = True
 
-        desc, params, info = flat_items[choice]
-        use_all_pages = False
-
-        if choice == "C6":
-            paginated_viewer(client, json_mgr, "live", done_map, fail_200_map, fail_other_map)
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if choice == "D5":
-            paginated_viewer(client, json_mgr, "movies", done_map, fail_200_map, fail_other_map)
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if choice == "E6":
-            paginated_viewer(client, json_mgr, "series", done_map, fail_200_map, fail_other_map)
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if choice == "C5":
-            batch_fetch_live(client, json_mgr, done_map, fail_200_map, fail_other_map)
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if choice == "D4":
-            batch_fetch_movies(client, json_mgr, done_map, fail_200_map, fail_other_map)
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if choice == "E5":
-            batch_fetch_series(client, json_mgr, done_map, fail_200_map, fail_other_map)
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if choice == "C3":
-            gid = input("  Enter genre_id for get_ordered_list: ").strip()
-            if not gid:
-                print("  Skipped — no genre_id provided.")
-                continue
-            mode = input("  Fetch 1 page or ALL pages? [1/all]: ").strip().lower()
-            params = {"type": "itv", "action": "get_ordered_list", "genre": gid, "p": "1", "JsHttpRequest": "1-xml"}
-            if mode == "all":
-                use_all_pages = True
-
-        elif choice == "C4":
-            cmd = input("  Enter cmd value for create_link: ").strip()
-            if not cmd:
-                print("  Skipped — no cmd provided.")
-                continue
-            params = {"type": "itv", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-
-        elif choice == "D2":
-            cid = input("  Enter category_id for VOD ordered_list: ").strip()
-            if not cid:
-                print("  Skipped — no category_id provided.")
-                continue
-            mode = input("  Fetch 1 page or ALL pages? [1/all]: ").strip().lower()
-            params = {"type": "vod", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
-            if mode == "all":
-                use_all_pages = True
-
-        elif choice == "D3":
-            cmd = input("  Enter cmd value for VOD create_link: ").strip()
-            if not cmd:
-                print("  Skipped — no cmd provided.")
-                continue
-            params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-
-        elif choice == "E2":
-            cid = input("  Enter category_id for Series ordered_list: ").strip()
-            if not cid:
-                print("  Skipped — no category_id provided.")
-                continue
-            mode = input("  Fetch 1 page or ALL pages? [1/all]: ").strip().lower()
-            params = {"type": "series", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
-            if mode == "all":
-                use_all_pages = True
-
-        elif choice == "E3":
-            sid = input("  Enter series_id (movie_id) for episode list: ").strip()
-            if not sid:
-                print("  Skipped — no series_id provided.")
-                continue
-            params = {"type": "series", "action": "get_ordered_list", "movie_id": sid, "season_id": "0", "episode_id": "0", "row": "0", "JsHttpRequest": "1-xml"}
-
-        elif choice == "E4":
-            cmd = input("  Enter cmd value for episode create_link: ").strip()
-            ep_num = input("  Enter episode number: ").strip() or "1"
-            if not cmd:
-                print("  Skipped — no cmd provided.")
-                continue
-            params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": ep_num, "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-
-        elif choice == "F3":
-            pins = ["0000", "1234", "3333"]
-            unlocked = False
-            for pin in pins:
-                print("\n  Trying PIN {} ...".format(pin))
-                params = {"type": "itv", "action": "set_parental_lock", "password": pin, "JsHttpRequest": "1-xml"}
-                result = client.fetch(params)
-                data = result.get("_data")
-                if data:
-                    js = data.get('js', {}) if isinstance(data, dict) else {}
-                    if js is True or (isinstance(js, dict) and js.get('result') in (True, 'true', 1)):
-                        print("  -> [OK] Unlocked with PIN {}!".format(pin))
-                        unlocked = True
-                        break
-
-            if unlocked:
-                safe_name = "type_itv_action_set_parental_lock_UNLOCKED"
-                fname = save_json(data, choice, safe_name)
-                print("  -> Saved to {}".format(fname))
-                done_map[choice] = True
-            else:
-                print("  -> [-] All PINs failed (0000, 1234, 3333)")
-                error_data = {
-                    "_error": True,
-                    "_timestamp": datetime.now().isoformat(),
-                    "_action": "type=itv&action=set_parental_lock",
-                    "_reason": "All PIN combinations failed (0000, 1234, 3333). Portal may require a different PIN or parental lock is already disabled.",
-                    "_tried_pins": pins,
-                    "_lockedpath": result.get("_lockedpath", [])
-                }
-                safe_name = "type_itv_action_set_parental_lock_ERROR"
-                filename = "temp/{}_{}.json".format(choice, safe_name)
-                with open(filename, 'w', encoding='utf-8') as f:
-                    json.dump(error_data, f, indent=2, ensure_ascii=False)
-                print("  -> Saved error to {}".format(filename))
-                fail_200_map[choice] = True
-
-            print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-            continue
-
-        if params is None:
-            print("[!] {} requires manual parameters.".format(choice))
-            continue
-
-        print("\n  Fetching {} — {} ...".format(choice, desc))
-
-        if use_all_pages:
-            result = client.fetch_all_pages(params)
+        if success:
+            json_mgr.mark_done(code)
+            print("  -> [OK] Step complete.")
         else:
-            result = client.fetch(params)
+            print("  -> [!] Step failed. Marking as done, continuing...")
+            json_mgr.mark_done(code)  # failed but treated as done, flow continues
 
-        safe_name = desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
-        fname, status_str, is_error, is_200 = handle_fetch_result(result, choice, safe_name)
+        if code != "G1":
+            input("  Press Enter to continue to next step...")
 
-        if is_error:
-            if is_200:
-                print("  -> [-] Saved error to {}".format(fname))
-                fail_200_map[choice] = True
-            else:
-                print("  -> [!] Saved error to {}".format(fname))
-                fail_other_map[choice] = True
-        else:
-            print("  -> [OK] Saved to {}".format(fname))
-            done_map[choice] = True
-
-            data = result.get("_data")
-            if data and isinstance(data, dict):
-                js = data.get("js", {})
-
-                if choice == "A2":
-                    json_mgr.update_profile(js)
-                elif choice == "B1":
-                    json_mgr.update_account(js)
-                elif choice == "C2":
-                    if isinstance(js, list):
-                        cats = js
-                    elif isinstance(js, dict):
-                        cats = js.get("data", [])
-                    else:
-                        cats = []
-                    json_mgr.update_live_categories(cats)
-                    probe_categories(client, json_mgr, "live", done_map, fail_200_map, fail_other_map)
-                elif choice == "C3":
-                    gid = params.get("genre", "")
-                    if isinstance(js, list):
-                        items = js
-                    elif isinstance(js, dict):
-                        items = js.get("data", [])
-                    else:
-                        items = []
-                    total = js.get("total_items", len(items)) if isinstance(js, dict) else len(items)
-                    json_mgr.update_live_channels(gid, items, total)
-                elif choice == "D1":
-                    if isinstance(js, list):
-                        cats = js
-                    elif isinstance(js, dict):
-                        cats = js.get("data", [])
-                    else:
-                        cats = []
-                    json_mgr.update_movie_categories(cats)
-                    probe_categories(client, json_mgr, "movies", done_map, fail_200_map, fail_other_map)
-                elif choice == "D2":
-                    cid = params.get("category", "")
-                    if isinstance(js, list):
-                        items = js
-                    elif isinstance(js, dict):
-                        items = js.get("data", [])
-                    else:
-                        items = []
-                    total = js.get("total_items", len(items)) if isinstance(js, dict) else len(items)
-                    json_mgr.update_movie_items(cid, items, total)
-                elif choice == "E1":
-                    if isinstance(js, list):
-                        cats = js
-                    elif isinstance(js, dict):
-                        cats = js.get("data", [])
-                    else:
-                        cats = []
-                    json_mgr.update_series_categories(cats)
-                    probe_categories(client, json_mgr, "series", done_map, fail_200_map, fail_other_map)
-                elif choice == "E2":
-                    cid = params.get("category", "")
-                    if isinstance(js, list):
-                        items = js
-                    elif isinstance(js, dict):
-                        items = js.get("data", [])
-                    else:
-                        items = []
-                    total = js.get("total_items", len(items)) if isinstance(js, dict) else len(items)
-                    json_mgr.update_series_items(cid, items, total)
-                elif choice == "E3":
-                    sid = params.get("movie_id", "")
-                    if isinstance(js, list):
-                        items = js
-                    elif isinstance(js, dict):
-                        items = js.get("data", [])
-                    else:
-                        items = []
-                    seasons_map = {}
-                    for ep in items:
-                        season_id = ep.get("season_id", "0")
-                        if season_id not in seasons_map:
-                            seasons_map[season_id] = {
-                                "season_id": season_id,
-                                "name": ep.get("season_name", "Season " + str(season_id)),
-                                "episodes": [],
-                                "cmd": ep.get("cmd", "")
-                            }
-                        seasons_map[season_id]["episodes"].append(ep.get("episode_num", ep.get("number", 0)))
-                    seasons = list(seasons_map.values())
-                    json_mgr.update_series_episodes(sid, seasons)
-
-        print_menu(done_map, fail_200_map, fail_other_map, expanded_cat)
-
+    print_section_status(len(FLAT_STEPS), json_mgr)
+    print("\n  All steps complete!")
     print("\n" + "=" * 60)
-    print("   Done! All fetched JSON files saved to temp/.")
+    print("   Done! All fetched data saved.")
     print("=" * 60)
 
 
