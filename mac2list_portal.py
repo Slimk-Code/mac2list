@@ -867,194 +867,313 @@ def probe_categories(client, json_mgr, section):
 
 
 # ============================================================
-# BATCH FETCH
+# CATEGORY VIEWER (20 per page)
 # ============================================================
+
+def view_categories(json_mgr, section):
+    """Paginated category viewer. 20 per page. Returns when user quits."""
+    if section == "live":
+        cats = json_mgr.data["live"].get("categories", [])
+        fetched = set(json_mgr.get_live_fetched())
+        failed = set(json_mgr.get_live_failed())
+        title = "Live Channel Categories"
+    elif section == "movies":
+        cats = json_mgr.data["movies"].get("categories", [])
+        fetched = set(json_mgr.get_movie_fetched())
+        failed = set(json_mgr.get_movie_failed())
+        title = "VOD Categories"
+    elif section == "series":
+        cats = json_mgr.data["series"].get("categories", [])
+        fetched = set(json_mgr.get_series_fetched())
+        failed = set(json_mgr.get_series_failed())
+        title = "Series Categories"
+    else:
+        return
+
+    cats = [c for c in cats if str(c.get("id")) != "*"]
+    total = len(cats)
+    if total == 0:
+        print("\n  No categories to view.")
+        input("  Press Enter to return...")
+        return
+
+    page_size = 20
+    page = 0
+    max_page = (total - 1) // page_size
+
+    while True:
+        clear_screen()
+        print("=" * 60)
+        print("   {} — Page {}/{}".format(title, page + 1, max_page + 1))
+        print("=" * 60)
+        print()
+        print("  {:<4} {:<6} {:<40} {:<10}".format("#", "Icon", "Name", "Status"))
+        print("  " + "-" * 56)
+
+        start = page * page_size
+        end = min(start + page_size, total)
+        for i in range(start, end):
+            cat = cats[i]
+            cid = str(cat.get("id", ""))
+            name = cat.get("title", cat.get("name", "Unknown"))[:38]
+            total_items = cat.get("total_items", 0)
+            if cid in fetched:
+                status = "Fetched"
+                icon = "[x]"
+            elif cid in failed:
+                status = "Failed"
+                icon = "[!]"
+            else:
+                status = "Pending"
+                icon = "[ ]"
+            print("  {:<4} {:<6} {:<40} {:<10} ({} items)".format(
+                i + 1, icon, name, status, total_items))
+
+        print()
+        print("  [Enter] Next page  |  [P] Previous  |  [Q] Quit")
+        choice = input("  > ").strip().upper()
+
+        if choice == "Q":
+            break
+        elif choice == "P":
+            if page > 0:
+                page -= 1
+        else:
+            if page < max_page:
+                page += 1
+            else:
+                page = 0
+
+
+# ============================================================
+# BATCH FETCH — stays pending until all done or ignored
+# ============================================================
+
+def _batch_prompt(section_name, fetched_count, failed_count, remaining_count, total_count):
+    print()
+    print("  {} Batch Fetch".format(section_name))
+    print("  Total: {} | Fetched: {} | Failed: {} | Remaining: {}".format(
+        total_count, fetched_count, failed_count, remaining_count))
+    print("  Press Enter to fetch more, [A]ll to fetch rest, [V]iew, or [I]gnore...")
+    return input("  > ").strip().upper()
+
 
 def batch_fetch_live(client, json_mgr):
     cats = json_mgr.data["live"].get("categories", [])
-    fetched = set(json_mgr.get_live_fetched())
-    failed = set(json_mgr.get_live_failed())
-
     all_ids = [str(c.get("id")) for c in cats if str(c.get("id")) != "*"]
-    remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
+    total = len(all_ids)
 
-    if not remaining:
-        print("\n  [OK] Nothing left to fetch. {} done, {} failed.".format(len(fetched), len(failed)))
-        return True
+    while True:
+        fetched = set(json_mgr.get_live_fetched())
+        failed = set(json_mgr.get_live_failed())
+        remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
 
-    print("\n  Live Batch Fetch")
-    print("  Total genres: {} | Remaining: {} | Fetched: {} | Failed: {}".format(len(all_ids), len(remaining), len(fetched), len(failed)))
-    count = input("  How many to fetch? (or 'all'): ").strip().lower()
+        if not remaining:
+            print("\n  [OK] All live genres fetched. {} done, {} failed.".format(len(fetched), len(failed)))
+            return True
 
-    if count == "all":
-        to_fetch = remaining[:]
-    else:
-        try:
-            n = int(count)
-            to_fetch = remaining[:n]
-        except:
-            print("  [!] Invalid input.")
-            return True  # treat as done, continue flow
+        choice = _batch_prompt("Live", len(fetched), len(failed), len(remaining), total)
 
-    if not to_fetch:
-        return True
+        if choice == "I":
+            print("  -> Ignored remaining {} genres.".format(len(remaining)))
+            return True
+        elif choice == "V":
+            view_categories(json_mgr, "live")
+            continue
+        elif choice == "A":
+            to_fetch = remaining[:]
+        else:
+            print("\n  How many to fetch? (or 'all'): ", end="")
+            count = input().strip().lower()
+            if count == "all":
+                to_fetch = remaining[:]
+            else:
+                try:
+                    n = int(count)
+                    to_fetch = remaining[:n]
+                except:
+                    print("  [!] Invalid input.")
+                    continue
 
-    print("\n  Fetching {} genres (all pages each)...".format(len(to_fetch)))
-    done_count = 0
-    fail_count = 0
+        if not to_fetch:
+            continue
 
-    for gid in to_fetch:
-        params = {"type": "itv", "action": "get_ordered_list", "genre": gid, "p": "1", "JsHttpRequest": "1-xml"}
-        result = client.fetch_all_pages(params)
-        data = result.get("_data")
+        print("\n  Fetching {} genres (all pages each)...".format(len(to_fetch)))
+        done_count = 0
+        fail_count = 0
 
-        if data and isinstance(data, dict):
-            js = data.get("js", {})
-            if isinstance(js, dict):
-                items = js.get("data", [])
-                total_items = js.get("total_items", len(items))
-                json_mgr.update_live_channels(gid, items, total_items)
-                done_count += 1
+        for gid in to_fetch:
+            params = {"type": "itv", "action": "get_ordered_list", "genre": gid, "p": "1", "JsHttpRequest": "1-xml"}
+            result = client.fetch_all_pages(params)
+            data = result.get("_data")
+
+            if data and isinstance(data, dict):
+                js = data.get("js", {})
+                if isinstance(js, dict):
+                    items = js.get("data", [])
+                    total_items = js.get("total_items", len(items))
+                    json_mgr.update_live_channels(gid, items, total_items)
+                    done_count += 1
+                else:
+                    json_mgr.mark_live_genre_failed(gid)
+                    fail_count += 1
             else:
                 json_mgr.mark_live_genre_failed(gid)
                 fail_count += 1
-        else:
-            json_mgr.mark_live_genre_failed(gid)
-            fail_count += 1
 
-        sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
-            done_count, len(to_fetch), fail_count, len(to_fetch) - done_count - fail_count))
-        sys.stdout.flush()
+            sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
+                len(fetched) + done_count, total, len(failed) + fail_count, total - len(fetched) - done_count - len(failed) - fail_count))
+            sys.stdout.flush()
 
-    print()
-    print("  -> [OK] Batch complete. {} fetched, {} failed.".format(done_count, fail_count))
-    return True
+        print()
+        print("  -> [OK] Batch round complete. {} fetched, {} failed this round.".format(done_count, fail_count))
+        # Loop back to prompt — stays pending
 
 
 def batch_fetch_movies(client, json_mgr):
     cats = json_mgr.data["movies"].get("categories", [])
-    fetched = set(json_mgr.get_movie_fetched())
-    failed = set(json_mgr.get_movie_failed())
-
     all_ids = [str(c.get("id")) for c in cats if str(c.get("id")) != "*"]
-    remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
+    total = len(all_ids)
 
-    if not remaining:
-        print("\n  [OK] Nothing left to fetch. {} done, {} failed.".format(len(fetched), len(failed)))
-        return True
+    while True:
+        fetched = set(json_mgr.get_movie_fetched())
+        failed = set(json_mgr.get_movie_failed())
+        remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
 
-    print("\n  Movie Batch Fetch")
-    print("  Total categories: {} | Remaining: {} | Fetched: {} | Failed: {}".format(len(all_ids), len(remaining), len(fetched), len(failed)))
-    count = input("  How many to fetch? (or 'all'): ").strip().lower()
-
-    if count == "all":
-        to_fetch = remaining[:]
-    else:
-        try:
-            n = int(count)
-            to_fetch = remaining[:n]
-        except:
-            print("  [!] Invalid input.")
+        if not remaining:
+            print("\n  [OK] All movie categories fetched. {} done, {} failed.".format(len(fetched), len(failed)))
             return True
 
-    if not to_fetch:
-        return True
+        choice = _batch_prompt("Movie", len(fetched), len(failed), len(remaining), total)
 
-    print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
-    done_count = 0
-    fail_count = 0
+        if choice == "I":
+            print("  -> Ignored remaining {} categories.".format(len(remaining)))
+            return True
+        elif choice == "V":
+            view_categories(json_mgr, "movies")
+            continue
+        elif choice == "A":
+            to_fetch = remaining[:]
+        else:
+            print("\n  How many to fetch? (or 'all'): ", end="")
+            count = input().strip().lower()
+            if count == "all":
+                to_fetch = remaining[:]
+            else:
+                try:
+                    n = int(count)
+                    to_fetch = remaining[:n]
+                except:
+                    print("  [!] Invalid input.")
+                    continue
 
-    for cid in to_fetch:
-        params = {"type": "vod", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
-        result = client.fetch_all_pages(params)
-        data = result.get("_data")
+        if not to_fetch:
+            continue
 
-        if data and isinstance(data, dict):
-            js = data.get("js", {})
-            if isinstance(js, dict):
-                items = js.get("data", [])
-                total_items = js.get("total_items", len(items))
-                json_mgr.update_movie_items(cid, items, total_items)
-                done_count += 1
+        print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
+        done_count = 0
+        fail_count = 0
+
+        for cid in to_fetch:
+            params = {"type": "vod", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
+            result = client.fetch_all_pages(params)
+            data = result.get("_data")
+
+            if data and isinstance(data, dict):
+                js = data.get("js", {})
+                if isinstance(js, dict):
+                    items = js.get("data", [])
+                    total_items = js.get("total_items", len(items))
+                    json_mgr.update_movie_items(cid, items, total_items)
+                    done_count += 1
+                else:
+                    json_mgr.mark_movie_category_failed(cid)
+                    fail_count += 1
             else:
                 json_mgr.mark_movie_category_failed(cid)
                 fail_count += 1
-        else:
-            json_mgr.mark_movie_category_failed(cid)
-            fail_count += 1
 
-        sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
-            done_count, len(to_fetch), fail_count, len(to_fetch) - done_count - fail_count))
-        sys.stdout.flush()
+            sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
+                len(fetched) + done_count, total, len(failed) + fail_count, total - len(fetched) - done_count - len(failed) - fail_count))
+            sys.stdout.flush()
 
-    print()
-    print("  -> [OK] Batch complete. {} fetched, {} failed.".format(done_count, fail_count))
-    return True
+        print()
+        print("  -> [OK] Batch round complete. {} fetched, {} failed this round.".format(done_count, fail_count))
 
 
 def batch_fetch_series(client, json_mgr):
     cats = json_mgr.data["series"].get("categories", [])
-    fetched = set(json_mgr.get_series_fetched())
-    failed = set(json_mgr.get_series_failed())
-
     all_ids = [str(c.get("id")) for c in cats if str(c.get("id")) != "*"]
-    remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
+    total = len(all_ids)
 
-    if not remaining:
-        print("\n  [OK] Nothing left to fetch. {} done, {} failed.".format(len(fetched), len(failed)))
-        return True
+    while True:
+        fetched = set(json_mgr.get_series_fetched())
+        failed = set(json_mgr.get_series_failed())
+        remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
 
-    print("\n  Series Batch Fetch")
-    print("  Total categories: {} | Remaining: {} | Fetched: {} | Failed: {}".format(len(all_ids), len(remaining), len(fetched), len(failed)))
-    count = input("  How many to fetch? (or 'all'): ").strip().lower()
-
-    if count == "all":
-        to_fetch = remaining[:]
-    else:
-        try:
-            n = int(count)
-            to_fetch = remaining[:n]
-        except:
-            print("  [!] Invalid input.")
+        if not remaining:
+            print("\n  [OK] All series categories fetched. {} done, {} failed.".format(len(fetched), len(failed)))
             return True
 
-    if not to_fetch:
-        return True
+        choice = _batch_prompt("Series", len(fetched), len(failed), len(remaining), total)
 
-    print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
-    done_count = 0
-    fail_count = 0
+        if choice == "I":
+            print("  -> Ignored remaining {} categories.".format(len(remaining)))
+            return True
+        elif choice == "V":
+            view_categories(json_mgr, "series")
+            continue
+        elif choice == "A":
+            to_fetch = remaining[:]
+        else:
+            print("\n  How many to fetch? (or 'all'): ", end="")
+            count = input().strip().lower()
+            if count == "all":
+                to_fetch = remaining[:]
+            else:
+                try:
+                    n = int(count)
+                    to_fetch = remaining[:n]
+                except:
+                    print("  [!] Invalid input.")
+                    continue
 
-    for cid in to_fetch:
-        params = {"type": "series", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
-        result = client.fetch_all_pages(params)
-        data = result.get("_data")
+        if not to_fetch:
+            continue
 
-        if data and isinstance(data, dict):
-            js = data.get("js", {})
-            if isinstance(js, dict):
-                items = js.get("data", [])
-                total_items = js.get("total_items", len(items))
-                json_mgr.update_series_items(cid, items, total_items)
-                done_count += 1
+        print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
+        done_count = 0
+        fail_count = 0
+
+        for cid in to_fetch:
+            params = {"type": "series", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
+            result = client.fetch_all_pages(params)
+            data = result.get("_data")
+
+            if data and isinstance(data, dict):
+                js = data.get("js", {})
+                if isinstance(js, dict):
+                    items = js.get("data", [])
+                    total_items = js.get("total_items", len(items))
+                    json_mgr.update_series_items(cid, items, total_items)
+                    done_count += 1
+                else:
+                    json_mgr.mark_series_category_failed(cid)
+                    fail_count += 1
             else:
                 json_mgr.mark_series_category_failed(cid)
                 fail_count += 1
-        else:
-            json_mgr.mark_series_category_failed(cid)
-            fail_count += 1
 
-        sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
-            done_count, len(to_fetch), fail_count, len(to_fetch) - done_count - fail_count))
-        sys.stdout.flush()
+            sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
+                len(fetched) + done_count, total, len(failed) + fail_count, total - len(fetched) - done_count - len(failed) - fail_count))
+            sys.stdout.flush()
 
-    print()
-    print("  -> [OK] Batch complete. {} fetched, {} failed.".format(done_count, fail_count))
-    return True
+        print()
+        print("  -> [OK] Batch round complete. {} fetched, {} failed this round.".format(done_count, fail_count))
 
 
 # ============================================================
-# DISPLAY — collapsed sections except current
+# DISPLAY — collapsed sections except current, NO step codes
 # ============================================================
 
 def print_section_status(current_step_idx, json_mgr):
@@ -1066,11 +1185,9 @@ def print_section_status(current_step_idx, json_mgr):
 
     flat_idx = 0
     for sec_key, sec in SECTIONS.items():
-        # Check if any step in this section is the current one
         section_steps = [flat_idx + j for j in range(len(sec["items"]))]
         is_current_section = current_step_idx in section_steps
 
-        # Count done/ignored in this section
         done_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
         ignored_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_ignored(code))
         total_count = len(sec["items"])
@@ -1086,7 +1203,8 @@ def print_section_status(current_step_idx, json_mgr):
                     mark = "[→]"
                 else:
                     mark = "[ ]"
-                print("    {} {:<4}  {:<45} {}".format(mark, code, desc, info))
+                # NO step code shown — just desc and info
+                print("    {} {:<50} {}".format(mark, desc, info))
                 flat_idx += 1
         else:
             status = ""
@@ -1101,8 +1219,8 @@ def print_section_status(current_step_idx, json_mgr):
     print("-" * 60)
 
 
-def prompt_continue(step_code, step_info):
-    print("\n  [{}] {}".format(step_code, step_info))
+def prompt_continue(step_code, step_info, step_desc):
+    print("\n  [{}] {}".format(step_desc, step_info))
     print("  Press Enter to continue or [I]gnore to skip...")
     choice = input("  > ").strip().upper()
     return choice == "I"
@@ -1185,7 +1303,7 @@ def run_resolve_step(client, json_mgr, step_code, step_desc):
         cmd = input("  Enter cmd value for live create_link: ").strip()
         if not cmd:
             print("  -> Skipped — no cmd provided.")
-            return True  # treat as done, continue
+            return True
         params = {"type": "itv", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
 
     elif step_code == "D3":
@@ -1219,7 +1337,7 @@ def run_resolve_step(client, json_mgr, step_code, step_desc):
 
     if is_error:
         print("  -> [!] Failed — saved error to {}".format(fname))
-        return True  # treat as done, continue flow
+        return True
 
     print("  -> [OK] Saved to {}".format(fname))
 
@@ -1286,7 +1404,7 @@ def run_f3_step(client, json_mgr):
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(error_data, f, indent=2, ensure_ascii=False)
         print("  -> Saved error to {}".format(filename))
-        return True  # treat as done, continue flow
+        return True
 
 
 # ============================================================
@@ -1435,7 +1553,7 @@ def main():
         if json_mgr.is_done(code) or json_mgr.is_ignored(code):
             continue
 
-        ignored = prompt_continue(code, info)
+        ignored = prompt_continue(code, info, desc)
 
         if ignored:
             json_mgr.mark_ignored(code)
@@ -1463,7 +1581,7 @@ def main():
             print("  -> [OK] Step complete.")
         else:
             print("  -> [!] Step failed. Marking as done, continuing...")
-            json_mgr.mark_done(code)  # failed but treated as done, flow continues
+            json_mgr.mark_done(code)
 
         if code != "G1":
             input("  Press Enter to continue to next step...")
