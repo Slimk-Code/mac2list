@@ -95,19 +95,19 @@ for sec_key, sec in SECTIONS.items():
 
 class IPTVPortal:
     def __init__(self, base_url, mac_address):
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self.mac = mac_address.upper().strip()
         self.session = requests.Session()
         self.token = None
         self.locked_url = f"{self.base_url}/portal.php"
 
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 1812 Safari/533.3',
-            'X-User-Agent': 'Model: MAG250; Link: Ethernet',
-            'Referer': f'{self.base_url}/c/',
-            'Cookie': f'mac={self.mac}; stb_lang=en; timezone=Europe%2FLondon',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
+            "User-Agent": "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 1812 Safari/533.3",
+            "X-User-Agent": "Model: MAG250; Link: Ethernet",
+            "Referer": f"{self.base_url}/c/",
+            "Cookie": f"mac={self.mac}; stb_lang=en; timezone=Europe%2FLondon",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
         })
 
     def _get(self, params):
@@ -124,12 +124,12 @@ class IPTVPortal:
                 pass
 
             try:
-                if text.strip().startswith('{'):
+                if text.strip().startswith("{"):
                     data = json.loads(text)
                     return {"_data": data, "_status": status, "_url": url, "_text": "", "_error": None, "_lockedpath": None}
-                elif 'js' in text:
-                    start = text.find('{')
-                    end = text.rfind('}') + 1
+                elif "js" in text:
+                    start = text.find("{")
+                    end = text.rfind("}") + 1
                     if start >= 0 and end > start:
                         data = json.loads(text[start:end])
                         return {"_data": data, "_status": status, "_url": url, "_text": "", "_error": None, "_lockedpath": None}
@@ -157,17 +157,17 @@ class IPTVPortal:
             }
 
     def handshake(self):
-        params = {'type': 'stb', 'action': 'handshake', 'JsHttpRequest': '1-xml'}
+        params = {"type": "stb", "action": "handshake", "JsHttpRequest": "1-xml"}
         result = self._get(params)
         data = result.get("_data")
 
         if data and isinstance(data, dict):
-            js = data.get('js', {})
+            js = data.get("js", {})
             if isinstance(js, dict):
-                token = js.get('token')
+                token = js.get("token")
                 if token:
                     self.token = token
-                    self.session.headers['Authorization'] = f'Bearer {token}'
+                    self.session.headers["Authorization"] = f"Bearer {token}"
 
         return result
 
@@ -222,7 +222,7 @@ class IPTVPortal:
         def _update_counter():
             with lock:
                 counter = "[{}/{}] pages — [{}/{}] items".format(done_count[0], pages, fetched_items[0], total)
-                sys.stdout.write("\r" + counter.ljust(80))
+                sys.stdout.write(chr(13) + counter.ljust(80))
                 sys.stdout.flush()
 
         def _fetch_page_thread(p):
@@ -232,7 +232,7 @@ class IPTVPortal:
             else:
                 with lock:
                     fail_msg = "    Page {}/{} FAILED after 3 retries".format(p, pages)
-                    sys.stdout.write("\r" + " " * 80 + "\r")
+                    sys.stdout.write(chr(13) + " " * 80 + chr(13))
                     sys.stdout.write(fail_msg + "\n")
                     sys.stdout.write("[{}/{}] pages — [{}/{}] items".format(done_count[0], pages, fetched_items[0], total).ljust(80))
                     sys.stdout.flush()
@@ -354,8 +354,8 @@ def trim_series_item(item):
 
 class JSONManager:
     def __init__(self, base_url, mac):
-        safe_portal = re.sub(r'[^a-zA-Z0-9]', '_', base_url.rstrip('/').replace('http://', '').replace('https://', ''))
-        safe_mac = mac.upper().replace(':', '_')
+        safe_portal = re.sub(r"[^a-zA-Z0-9]", "_", base_url.rstrip("/").replace("http://", "").replace("https://", ""))
+        safe_mac = mac.upper().replace(":", "_")
         self.filename = f"temp/{safe_portal}_{safe_mac}.json"
         self.data = self._load()
         self._ensure_tracking()
@@ -363,7 +363,7 @@ class JSONManager:
     def _load(self):
         if os.path.exists(self.filename):
             try:
-                with open(self.filename, 'r', encoding='utf-8') as f:
+                with open(self.filename, "r", encoding="utf-8") as f:
                     return json.load(f)
             except:
                 pass
@@ -402,7 +402,7 @@ class JSONManager:
                 self.data[section][key] = []
 
     def save(self):
-        with open(self.filename, 'w', encoding='utf-8') as f:
+        with open(self.filename, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
         return self.filename
 
@@ -454,7 +454,6 @@ class JSONManager:
 
     def update_live_categories(self, categories):
         existing = {str(c.get("id")): c for c in self.data["live"].get("categories", [])}
-
         merged = []
         for cat in categories:
             cat_id = str(cat.get("id"))
@@ -466,9 +465,7 @@ class JSONManager:
                 merged.append(merged_cat)
             else:
                 merged.append(dict(cat))
-
         self.data["live"]["categories"] = merged
-
         all_ids = [str(c.get("id")) for c in merged if str(c.get("id")) != "*"]
         fetched = set(self.data["live"].get("_fetched_genres", []))
         failed = set(self.data["live"].get("_failed_genres", []))
@@ -486,16 +483,8 @@ class JSONManager:
                 found = True
                 break
         if not found:
-            cats.append({
-                "id": str(genre_id),
-                "title": "Unknown",
-                "censored": 0,
-                "total_items": total_items,
-                "channels": trimmed
-            })
-        self.data["live"]["total_channels"] = sum(
-            c.get("total_items", 0) for c in cats
-        )
+            cats.append({"id": str(genre_id), "title": "Unknown", "censored": 0, "total_items": total_items, "channels": trimmed})
+        self.data["live"]["total_channels"] = sum(c.get("total_items", 0) for c in cats)
         gid = str(genre_id)
         if gid in self.data["live"].get("_remaining_genres", []):
             self.data["live"]["_remaining_genres"].remove(gid)
@@ -523,7 +512,6 @@ class JSONManager:
 
     def update_movie_categories(self, categories):
         existing = {str(c.get("id")): c for c in self.data["movies"].get("categories", [])}
-
         merged = []
         for cat in categories:
             cat_id = str(cat.get("id"))
@@ -535,9 +523,7 @@ class JSONManager:
                 merged.append(merged_cat)
             else:
                 merged.append(dict(cat))
-
         self.data["movies"]["categories"] = merged
-
         all_ids = [str(c.get("id")) for c in merged if str(c.get("id")) != "*"]
         fetched = set(self.data["movies"].get("_fetched_categories", []))
         failed = set(self.data["movies"].get("_failed_categories", []))
@@ -555,16 +541,8 @@ class JSONManager:
                 found = True
                 break
         if not found:
-            cats.append({
-                "id": str(category_id),
-                "title": "Unknown",
-                "censored": 0,
-                "total_items": total_items,
-                "items": trimmed
-            })
-        self.data["movies"]["total_items"] = sum(
-            c.get("total_items", 0) for c in cats
-        )
+            cats.append({"id": str(category_id), "title": "Unknown", "censored": 0, "total_items": total_items, "items": trimmed})
+        self.data["movies"]["total_items"] = sum(c.get("total_items", 0) for c in cats)
         cid = str(category_id)
         if cid in self.data["movies"].get("_remaining_categories", []):
             self.data["movies"]["_remaining_categories"].remove(cid)
@@ -592,7 +570,6 @@ class JSONManager:
 
     def update_series_categories(self, categories):
         existing = {str(c.get("id")): c for c in self.data["series"].get("categories", [])}
-
         merged = []
         for cat in categories:
             cat_id = str(cat.get("id"))
@@ -604,9 +581,7 @@ class JSONManager:
                 merged.append(merged_cat)
             else:
                 merged.append(dict(cat))
-
         self.data["series"]["categories"] = merged
-
         all_ids = [str(c.get("id")) for c in merged if str(c.get("id")) != "*"]
         fetched = set(self.data["series"].get("_fetched_categories", []))
         failed = set(self.data["series"].get("_failed_categories", []))
@@ -624,16 +599,8 @@ class JSONManager:
                 found = True
                 break
         if not found:
-            cats.append({
-                "id": str(category_id),
-                "title": "Unknown",
-                "censored": 0,
-                "total_items": total_items,
-                "items": trimmed
-            })
-        self.data["series"]["total_items"] = sum(
-            c.get("total_items", 0) for c in cats
-        )
+            cats.append({"id": str(category_id), "title": "Unknown", "censored": 0, "total_items": total_items, "items": trimmed})
+        self.data["series"]["total_items"] = sum(c.get("total_items", 0) for c in cats)
         cid = str(category_id)
         if cid in self.data["series"].get("_remaining_categories", []):
             self.data["series"]["_remaining_categories"].remove(cid)
@@ -671,28 +638,20 @@ class JSONManager:
 
     def get_live_remaining(self):
         return self.data["live"].get("_remaining_genres", [])
-
     def get_live_fetched(self):
         return self.data["live"].get("_fetched_genres", [])
-
     def get_live_failed(self):
         return self.data["live"].get("_failed_genres", [])
-
     def get_movie_remaining(self):
         return self.data["movies"].get("_remaining_categories", [])
-
     def get_movie_fetched(self):
         return self.data["movies"].get("_fetched_categories", [])
-
     def get_movie_failed(self):
         return self.data["movies"].get("_failed_categories", [])
-
     def get_series_remaining(self):
         return self.data["series"].get("_remaining_categories", [])
-
     def get_series_fetched(self):
         return self.data["series"].get("_fetched_categories", [])
-
     def get_series_failed(self):
         return self.data["series"].get("_failed_categories", [])
 
@@ -702,14 +661,14 @@ class JSONManager:
 # ============================================================
 
 def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    os.system("cls" if os.name == "nt" else "clear")
 
 
 def save_json(data, code, action_name):
     if not data:
         return None
     filename = f"temp/{code}_{action_name}.json"
-    with open(filename, 'w', encoding='utf-8') as f:
+    with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return filename
 
@@ -717,43 +676,18 @@ def save_json(data, code, action_name):
 def save_error_json(code, action_name, status, url, error_msg, lockedpath):
     if lockedpath:
         reason = "Locked path returned empty/malformed data. See _lockedpath for details."
-        error_data = {
-            "_error": True,
-            "_timestamp": datetime.now().isoformat(),
-            "_action": action_name,
-            "_reason": reason,
-            "_lockedpath": lockedpath
-        }
+        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_lockedpath": lockedpath}
     elif status == 200:
         reason = "HTTP 200 OK from {} — portal connected but returned empty/malformed data.".format(url)
-        error_data = {
-            "_error": True,
-            "_timestamp": datetime.now().isoformat(),
-            "_action": action_name,
-            "_reason": reason,
-            "_url": url
-        }
+        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
     elif status is not None:
         reason = "HTTP {} from {} — request failed. Portal rejected the call.".format(status, url)
-        error_data = {
-            "_error": True,
-            "_timestamp": datetime.now().isoformat(),
-            "_action": action_name,
-            "_reason": reason,
-            "_url": url
-        }
+        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
     else:
         reason = "Connection failed — could not reach endpoint. Error: {}.".format(error_msg)
-        error_data = {
-            "_error": True,
-            "_timestamp": datetime.now().isoformat(),
-            "_action": action_name,
-            "_reason": reason,
-            "_url": url
-        }
-
+        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
     filename = f"temp/{code}_{action_name}_ERROR.json"
-    with open(filename, 'w', encoding='utf-8') as f:
+    with open(filename, "w", encoding="utf-8") as f:
         json.dump(error_data, f, indent=2, ensure_ascii=False)
     return filename
 
@@ -764,7 +698,6 @@ def handle_fetch_result(result, code, safe_name):
     url = result.get("_url")
     error_msg = result.get("_error")
     lockedpath = result.get("_lockedpath")
-
     if data:
         fname = save_json(data, code, safe_name)
         return fname, "ok", False, False
@@ -802,26 +735,17 @@ def probe_categories(client, json_mgr, section):
         grand_fn = json_mgr.set_series_grand_total
     else:
         return
-
     total = len(cats)
     if total == 0:
         return
-
     wildcard = None
     for cat in cats:
         if str(cat.get("id")) == "*":
             wildcard = cat
             break
-
     if wildcard:
         print("\n  Probing wildcard '*' for grand total...")
-        params = {
-            "type": action_type,
-            "action": action,
-            id_key: "*",
-            "p": "1",
-            "JsHttpRequest": "1-xml"
-        }
+        params = {"type": action_type, "action": action, id_key: "*", "p": "1", "JsHttpRequest": "1-xml"}
         result = client.fetch(params)
         data = result.get("_data")
         if data and isinstance(data, dict):
@@ -830,48 +754,37 @@ def probe_categories(client, json_mgr, section):
                 grand_total = js.get("total_items", 0)
                 grand_fn(grand_total)
                 print("  -> Grand total: {} items".format(grand_total))
-
     print("\n  Probing page 1 of {} {} categories...".format(total, section))
     probed = 0
-
     for cat in cats:
         cat_id = str(cat.get("id", ""))
         if not cat_id or cat_id == "*":
             continue
-
-        params = {
-            "type": action_type,
-            "action": action,
-            id_key: cat_id,
-            "p": "1",
-            "JsHttpRequest": "1-xml"
-        }
+        params = {"type": action_type, "action": action, id_key: cat_id, "p": "1", "JsHttpRequest": "1-xml"}
         result = client.fetch(params)
         data = result.get("_data")
-
         if data and isinstance(data, dict):
             js = data.get("js", {})
             if isinstance(js, dict):
                 total_items = js.get("total_items", 0)
                 cat["total_items"] = total_items
                 mark_fn(cat_id)
-
         probed += 1
-        sys.stdout.write("\r  [{}/{}] categories probed".format(probed, total))
+        sys.stdout.write(chr(13) + "  [{}/{}] categories probed".format(probed, total))
         sys.stdout.flush()
         time.sleep(0.3)
-
     print()
     json_mgr.save()
     print("  -> [OK] All {} categories probed. Saved to JSON.".format(total))
 
 
 # ============================================================
-# CATEGORY VIEWER (20 per page)
+# CATEGORY VIEWER (20 per page) with multi-number fetch
 # ============================================================
 
-def view_categories(json_mgr, section):
-    """Paginated category viewer. 20 per page. Returns when user quits."""
+def view_categories(json_mgr, section, client=None):
+    """Paginated category viewer. 20 per page.
+    Returns list of category IDs to fetch, or empty list if quit."""
     if section == "live":
         cats = json_mgr.data["live"].get("categories", [])
         fetched = set(json_mgr.get_live_fetched())
@@ -888,19 +801,17 @@ def view_categories(json_mgr, section):
         failed = set(json_mgr.get_series_failed())
         title = "Series Categories"
     else:
-        return
-
+        return []
     cats = [c for c in cats if str(c.get("id")) != "*"]
     total = len(cats)
     if total == 0:
         print("\n  No categories to view.")
         input("  Press Enter to return...")
-        return
-
+        return []
     page_size = 20
     page = 0
     max_page = (total - 1) // page_size
-
+    to_fetch_ids = []
     while True:
         clear_screen()
         print("=" * 60)
@@ -909,7 +820,6 @@ def view_categories(json_mgr, section):
         print()
         print("  {:<4} {:<6} {:<40} {:<10}".format("#", "Icon", "Name", "Status"))
         print("  " + "-" * 56)
-
         start = page * page_size
         end = min(start + page_size, total)
         for i in range(start, end):
@@ -926,250 +836,205 @@ def view_categories(json_mgr, section):
             else:
                 status = "Pending"
                 icon = "[ ]"
-            print("  {:<4} {:<6} {:<40} {:<10} ({} items)".format(
-                i + 1, icon, name, status, total_items))
-
+            print("  {:<4} {:<6} {:<40} {:<10} ({} items)".format(i + 1, icon, name, status, total_items))
         print()
-        print("  [Enter] Next page  |  [P] Previous  |  [Q] Quit")
-        choice = input("  > ").strip().upper()
-
-        if choice == "Q":
+        print("  [Enter] Next page  |  [1-{}] Fetch that #  |  [Q] Back to batch".format(end - start))
+        choice = input("  > ").strip()
+        if choice.upper() == "Q":
             break
-        elif choice == "P":
-            if page > 0:
-                page -= 1
-        else:
+        elif choice == "":
             if page < max_page:
                 page += 1
             else:
                 page = 0
+        else:
+            # Parse multiple numbers (comma, space, or mixed)
+            nums = []
+            for part in re.split(r"[,\s]+", choice):
+                part = part.strip()
+                if part.isdigit():
+                    n = int(part)
+                    if 1 <= n <= total:
+                        nums.append(n)
+            if nums:
+                # Convert to category IDs
+                for n in nums:
+                    cat = cats[n - 1]
+                    cid = str(cat.get("id", ""))
+                    if cid and cid not in fetched and cid not in failed:
+                        to_fetch_ids.append(cid)
+                # Remove duplicates while preserving order
+                seen = set()
+                to_fetch_ids = [x for x in to_fetch_ids if not (x in seen or seen.add(x))]
+                break
+    return to_fetch_ids
 
 
 # ============================================================
 # BATCH FETCH — stays pending until all done or ignored
+# Single updating counter, viewer integrated
 # ============================================================
+
+def _update_batch_counter(done, failed, total):
+    remaining = total - done - failed
+    line = "[{}/{}] done | {} failed | {} remaining".format(done, total, failed, remaining)
+    sys.stdout.write(chr(13) + "  " + line.ljust(70))
+    sys.stdout.flush()
+
 
 def _batch_prompt(section_name, fetched_count, failed_count, remaining_count, total_count):
     print()
     print("  {} Batch Fetch".format(section_name))
     print("  Total: {} | Fetched: {} | Failed: {} | Remaining: {}".format(
         total_count, fetched_count, failed_count, remaining_count))
-    print("  Press Enter to fetch more, [A]ll to fetch rest, [V]iew, or [I]gnore...")
+    print("  Press Enter to fetch more, [A]ll, [V]iew, or [I]gnore...")
     return input("  > ").strip().upper()
 
 
-def batch_fetch_live(client, json_mgr):
-    cats = json_mgr.data["live"].get("categories", [])
+def _fetch_single_category(client, json_mgr, section, cat_id, action_type, action, id_key):
+    """Fetch one category and update json_mgr. Returns (success, items_count)."""
+    params = {"type": action_type, "action": action, id_key: cat_id, "p": "1", "JsHttpRequest": "1-xml"}
+    if action_type == "vod" or action_type == "series":
+        params["fav"] = "0"
+        params["sortby"] = "added"
+        params["hd"] = "0"
+    result = client.fetch_all_pages(params)
+    data = result.get("_data")
+    if data and isinstance(data, dict):
+        js = data.get("js", {})
+        if isinstance(js, dict):
+            items = js.get("data", [])
+            total_items = js.get("total_items", len(items))
+            if section == "live":
+                json_mgr.update_live_channels(cat_id, items, total_items)
+            elif section == "movies":
+                json_mgr.update_movie_items(cat_id, items, total_items)
+            elif section == "series":
+                json_mgr.update_series_items(cat_id, items, total_items)
+            return True, total_items
+    if section == "live":
+        json_mgr.mark_live_genre_failed(cat_id)
+    elif section == "movies":
+        json_mgr.mark_movie_category_failed(cat_id)
+    elif section == "series":
+        json_mgr.mark_series_category_failed(cat_id)
+    return False, 0
+
+
+def batch_fetch_section(client, json_mgr, section):
+    """Main batch fetch loop for a section. Auto-shows viewer on first entry."""
+    if section == "live":
+        cats = json_mgr.data["live"].get("categories", [])
+        action_type = "itv"
+        action = "get_ordered_list"
+        id_key = "genre"
+        get_fetched = json_mgr.get_live_fetched
+        get_failed = json_mgr.get_live_failed
+        section_name = "Live"
+    elif section == "movies":
+        cats = json_mgr.data["movies"].get("categories", [])
+        action_type = "vod"
+        action = "get_ordered_list"
+        id_key = "category"
+        get_fetched = json_mgr.get_movie_fetched
+        get_failed = json_mgr.get_movie_failed
+        section_name = "Movie"
+    elif section == "series":
+        cats = json_mgr.data["series"].get("categories", [])
+        action_type = "series"
+        action = "get_ordered_list"
+        id_key = "category"
+        get_fetched = json_mgr.get_series_fetched
+        get_failed = json_mgr.get_series_failed
+        section_name = "Series"
+    else:
+        return True
+
     all_ids = [str(c.get("id")) for c in cats if str(c.get("id")) != "*"]
     total = len(all_ids)
+    first_time = True
 
     while True:
-        fetched = set(json_mgr.get_live_fetched())
-        failed = set(json_mgr.get_live_failed())
+        fetched = set(get_fetched())
+        failed = set(get_failed())
         remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
 
         if not remaining:
-            print("\n  [OK] All live genres fetched. {} done, {} failed.".format(len(fetched), len(failed)))
+            print("\n  [OK] All {} categories fetched. {} done, {} failed.".format(section_name.lower(), len(fetched), len(failed)))
             return True
 
-        choice = _batch_prompt("Live", len(fetched), len(failed), len(remaining), total)
+        # Auto-show viewer on first entry
+        if first_time:
+            first_time = False
+            to_fetch = view_categories(json_mgr, section, client)
+            if to_fetch:
+                # Fetch selected from viewer
+                print("\n  Fetching {} selected categories...".format(len(to_fetch)))
+                done_count = len(fetched)
+                fail_count = len(failed)
+                for cid in to_fetch:
+                    ok, _ = _fetch_single_category(client, json_mgr, section, cid, action_type, action, id_key)
+                    if ok:
+                        done_count += 1
+                    else:
+                        fail_count += 1
+                    _update_batch_counter(done_count, fail_count, total)
+                    time.sleep(0.1)
+                print()  # newline after counter
+                print("  -> [OK] {} fetched.".format(len(to_fetch)))
+                continue  # loop back to prompt with updated counts
+            # If viewer returned empty (Q), fall through to batch prompt
+
+        choice = _batch_prompt(section_name, len(fetched), len(failed), len(remaining), total)
 
         if choice == "I":
-            print("  -> Ignored remaining {} genres.".format(len(remaining)))
+            print("  -> Ignored remaining {} categories.".format(len(remaining)))
             return True
         elif choice == "V":
-            view_categories(json_mgr, "live")
+            to_fetch = view_categories(json_mgr, section, client)
+            if to_fetch:
+                print("\n  Fetching {} selected categories...".format(len(to_fetch)))
+                done_count = len(fetched)
+                fail_count = len(failed)
+                for cid in to_fetch:
+                    ok, _ = _fetch_single_category(client, json_mgr, section, cid, action_type, action, id_key)
+                    if ok:
+                        done_count += 1
+                    else:
+                        fail_count += 1
+                    _update_batch_counter(done_count, fail_count, total)
+                    time.sleep(0.1)
+                print()
+                print("  -> [OK] {} fetched.".format(len(to_fetch)))
             continue
         elif choice == "A":
             to_fetch = remaining[:]
         else:
-            print("\n  How many to fetch? (or 'all'): ", end="")
-            count = input().strip().lower()
-            if count == "all":
-                to_fetch = remaining[:]
-            else:
-                try:
-                    n = int(count)
-                    to_fetch = remaining[:n]
-                except:
-                    print("  [!] Invalid input.")
-                    continue
+            # Try to parse as number
+            try:
+                n = int(choice)
+                to_fetch = remaining[:n]
+            except:
+                print("  [!] Invalid input.")
+                continue
 
         if not to_fetch:
             continue
 
-        print("\n  Fetching {} genres (all pages each)...".format(len(to_fetch)))
-        done_count = 0
-        fail_count = 0
-
-        for gid in to_fetch:
-            params = {"type": "itv", "action": "get_ordered_list", "genre": gid, "p": "1", "JsHttpRequest": "1-xml"}
-            result = client.fetch_all_pages(params)
-            data = result.get("_data")
-
-            if data and isinstance(data, dict):
-                js = data.get("js", {})
-                if isinstance(js, dict):
-                    items = js.get("data", [])
-                    total_items = js.get("total_items", len(items))
-                    json_mgr.update_live_channels(gid, items, total_items)
-                    done_count += 1
-                else:
-                    json_mgr.mark_live_genre_failed(gid)
-                    fail_count += 1
+        print("\n  Fetching {} categories...".format(len(to_fetch)))
+        done_count = len(fetched)
+        fail_count = len(failed)
+        for cid in to_fetch:
+            ok, _ = _fetch_single_category(client, json_mgr, section, cid, action_type, action, id_key)
+            if ok:
+                done_count += 1
             else:
-                json_mgr.mark_live_genre_failed(gid)
                 fail_count += 1
-
-            sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
-                len(fetched) + done_count, total, len(failed) + fail_count, total - len(fetched) - done_count - len(failed) - fail_count))
-            sys.stdout.flush()
-
+            _update_batch_counter(done_count, fail_count, total)
+            time.sleep(0.1)
         print()
-        print("  -> [OK] Batch round complete. {} fetched, {} failed this round.".format(done_count, fail_count))
+        print("  -> [OK] {} fetched.".format(len(to_fetch)))
         # Loop back to prompt — stays pending
-
-
-def batch_fetch_movies(client, json_mgr):
-    cats = json_mgr.data["movies"].get("categories", [])
-    all_ids = [str(c.get("id")) for c in cats if str(c.get("id")) != "*"]
-    total = len(all_ids)
-
-    while True:
-        fetched = set(json_mgr.get_movie_fetched())
-        failed = set(json_mgr.get_movie_failed())
-        remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
-
-        if not remaining:
-            print("\n  [OK] All movie categories fetched. {} done, {} failed.".format(len(fetched), len(failed)))
-            return True
-
-        choice = _batch_prompt("Movie", len(fetched), len(failed), len(remaining), total)
-
-        if choice == "I":
-            print("  -> Ignored remaining {} categories.".format(len(remaining)))
-            return True
-        elif choice == "V":
-            view_categories(json_mgr, "movies")
-            continue
-        elif choice == "A":
-            to_fetch = remaining[:]
-        else:
-            print("\n  How many to fetch? (or 'all'): ", end="")
-            count = input().strip().lower()
-            if count == "all":
-                to_fetch = remaining[:]
-            else:
-                try:
-                    n = int(count)
-                    to_fetch = remaining[:n]
-                except:
-                    print("  [!] Invalid input.")
-                    continue
-
-        if not to_fetch:
-            continue
-
-        print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
-        done_count = 0
-        fail_count = 0
-
-        for cid in to_fetch:
-            params = {"type": "vod", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
-            result = client.fetch_all_pages(params)
-            data = result.get("_data")
-
-            if data and isinstance(data, dict):
-                js = data.get("js", {})
-                if isinstance(js, dict):
-                    items = js.get("data", [])
-                    total_items = js.get("total_items", len(items))
-                    json_mgr.update_movie_items(cid, items, total_items)
-                    done_count += 1
-                else:
-                    json_mgr.mark_movie_category_failed(cid)
-                    fail_count += 1
-            else:
-                json_mgr.mark_movie_category_failed(cid)
-                fail_count += 1
-
-            sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
-                len(fetched) + done_count, total, len(failed) + fail_count, total - len(fetched) - done_count - len(failed) - fail_count))
-            sys.stdout.flush()
-
-        print()
-        print("  -> [OK] Batch round complete. {} fetched, {} failed this round.".format(done_count, fail_count))
-
-
-def batch_fetch_series(client, json_mgr):
-    cats = json_mgr.data["series"].get("categories", [])
-    all_ids = [str(c.get("id")) for c in cats if str(c.get("id")) != "*"]
-    total = len(all_ids)
-
-    while True:
-        fetched = set(json_mgr.get_series_fetched())
-        failed = set(json_mgr.get_series_failed())
-        remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
-
-        if not remaining:
-            print("\n  [OK] All series categories fetched. {} done, {} failed.".format(len(fetched), len(failed)))
-            return True
-
-        choice = _batch_prompt("Series", len(fetched), len(failed), len(remaining), total)
-
-        if choice == "I":
-            print("  -> Ignored remaining {} categories.".format(len(remaining)))
-            return True
-        elif choice == "V":
-            view_categories(json_mgr, "series")
-            continue
-        elif choice == "A":
-            to_fetch = remaining[:]
-        else:
-            print("\n  How many to fetch? (or 'all'): ", end="")
-            count = input().strip().lower()
-            if count == "all":
-                to_fetch = remaining[:]
-            else:
-                try:
-                    n = int(count)
-                    to_fetch = remaining[:n]
-                except:
-                    print("  [!] Invalid input.")
-                    continue
-
-        if not to_fetch:
-            continue
-
-        print("\n  Fetching {} categories (all pages each)...".format(len(to_fetch)))
-        done_count = 0
-        fail_count = 0
-
-        for cid in to_fetch:
-            params = {"type": "series", "action": "get_ordered_list", "category": cid, "fav": "0", "sortby": "added", "hd": "0", "p": "1", "JsHttpRequest": "1-xml"}
-            result = client.fetch_all_pages(params)
-            data = result.get("_data")
-
-            if data and isinstance(data, dict):
-                js = data.get("js", {})
-                if isinstance(js, dict):
-                    items = js.get("data", [])
-                    total_items = js.get("total_items", len(items))
-                    json_mgr.update_series_items(cid, items, total_items)
-                    done_count += 1
-                else:
-                    json_mgr.mark_series_category_failed(cid)
-                    fail_count += 1
-            else:
-                json_mgr.mark_series_category_failed(cid)
-                fail_count += 1
-
-            sys.stdout.write("\r  [{}/{}] done | {} failed | {} remaining".format(
-                len(fetched) + done_count, total, len(failed) + fail_count, total - len(fetched) - done_count - len(failed) - fail_count))
-            sys.stdout.flush()
-
-        print()
-        print("  -> [OK] Batch round complete. {} fetched, {} failed this round.".format(done_count, fail_count))
 
 
 # ============================================================
@@ -1182,18 +1047,15 @@ def print_section_status(current_step_idx, json_mgr):
     print("   IPTV Portal JSON Extractor v16 — Linear Flow")
     print("=" * 60)
     print()
-
     flat_idx = 0
     for sec_key, sec in SECTIONS.items():
         section_steps = [flat_idx + j for j in range(len(sec["items"]))]
         is_current_section = current_step_idx in section_steps
-
         done_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
         ignored_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_ignored(code))
         total_count = len(sec["items"])
-
         if is_current_section:
-            print("  ▼ {} — {}  ({}/{} done)".format(sec_key, sec['title'], done_count, total_count))
+            print("  ▼ {} — {}  ({}/{} done)".format(sec_key, sec["title"], done_count, total_count))
             for code, desc, info, _ in sec["items"]:
                 if json_mgr.is_done(code):
                     mark = "[x]"
@@ -1203,7 +1065,6 @@ def print_section_status(current_step_idx, json_mgr):
                     mark = "[→]"
                 else:
                     mark = "[ ]"
-                # NO step code shown — just desc and info
                 print("    {} {:<50} {}".format(mark, desc, info))
                 flat_idx += 1
         else:
@@ -1212,10 +1073,9 @@ def print_section_status(current_step_idx, json_mgr):
                 status = " [all done]"
             elif done_count > 0 or ignored_count > 0:
                 status = " [{}/{} done]".format(done_count, total_count)
-            print("  ▶ {} — {}{}".format(sec_key, sec['title'], status))
+            print("  ▶ {} — {}{}".format(sec_key, sec["title"], status))
             flat_idx += len(sec["items"])
         print()
-
     print("-" * 60)
 
 
@@ -1234,67 +1094,42 @@ def run_auto_fetch_step(client, json_mgr, step_code, step_desc):
     params = STEP_PARAMS.get(step_code)
     if not params:
         return False
-
     result = client.fetch(params)
     safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
     fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
-
     if is_error:
         print("  -> [!] Failed — saved error to {}".format(fname))
         return False
-
     print("  -> [OK] Saved to {}".format(fname))
-
     data = result.get("_data")
     if data and isinstance(data, dict):
         js = data.get("js", {})
-
         if step_code == "A2":
             json_mgr.update_profile(js)
         elif step_code == "B1":
             json_mgr.update_account(js)
         elif step_code == "C2":
-            if isinstance(js, list):
-                cats = js
-            elif isinstance(js, dict):
-                cats = js.get("data", [])
-            else:
-                cats = []
+            cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
             json_mgr.update_live_categories(cats)
             probe_categories(client, json_mgr, "live")
         elif step_code == "D1":
-            if isinstance(js, list):
-                cats = js
-            elif isinstance(js, dict):
-                cats = js.get("data", [])
-            else:
-                cats = []
+            cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
             json_mgr.update_movie_categories(cats)
             probe_categories(client, json_mgr, "movies")
         elif step_code == "E1":
-            if isinstance(js, list):
-                cats = js
-            elif isinstance(js, dict):
-                cats = js.get("data", [])
-            else:
-                cats = []
+            cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
             json_mgr.update_series_categories(cats)
             probe_categories(client, json_mgr, "series")
-        elif step_code == "F1":
-            pass
-        elif step_code == "F2":
-            pass
-
     return True
 
 
 def run_batch_step(client, json_mgr, step_code):
     if step_code == "C5":
-        return batch_fetch_live(client, json_mgr)
+        return batch_fetch_section(client, json_mgr, "live")
     elif step_code == "D4":
-        return batch_fetch_movies(client, json_mgr)
+        return batch_fetch_section(client, json_mgr, "movies")
     elif step_code == "E5":
-        return batch_fetch_series(client, json_mgr)
+        return batch_fetch_section(client, json_mgr, "series")
     return True
 
 
@@ -1305,21 +1140,18 @@ def run_resolve_step(client, json_mgr, step_code, step_desc):
             print("  -> Skipped — no cmd provided.")
             return True
         params = {"type": "itv", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-
     elif step_code == "D3":
         cmd = input("  Enter cmd value for VOD create_link: ").strip()
         if not cmd:
             print("  -> Skipped — no cmd provided.")
             return True
         params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-
     elif step_code == "E3":
         sid = input("  Enter series_id (movie_id) for episode list: ").strip()
         if not sid:
             print("  -> Skipped — no series_id provided.")
             return True
         params = {"type": "series", "action": "get_ordered_list", "movie_id": sid, "season_id": "0", "episode_id": "0", "row": "0", "JsHttpRequest": "1-xml"}
-
     elif step_code == "E4":
         cmd = input("  Enter cmd value for episode create_link: ").strip()
         ep_num = input("  Enter episode number: ").strip() or "1"
@@ -1327,45 +1159,29 @@ def run_resolve_step(client, json_mgr, step_code, step_desc):
             print("  -> Skipped — no cmd provided.")
             return True
         params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": ep_num, "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-
     else:
         return True
-
     result = client.fetch(params)
     safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
     fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
-
     if is_error:
         print("  -> [!] Failed — saved error to {}".format(fname))
         return True
-
     print("  -> [OK] Saved to {}".format(fname))
-
     if step_code == "E3":
         data = result.get("_data")
         if data and isinstance(data, dict):
             js = data.get("js", {})
-            if isinstance(js, list):
-                items = js
-            elif isinstance(js, dict):
-                items = js.get("data", [])
-            else:
-                items = []
+            items = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
             sid = params.get("movie_id", "")
             seasons_map = {}
             for ep in items:
                 season_id = ep.get("season_id", "0")
                 if season_id not in seasons_map:
-                    seasons_map[season_id] = {
-                        "season_id": season_id,
-                        "name": ep.get("season_name", "Season " + str(season_id)),
-                        "episodes": [],
-                        "cmd": ep.get("cmd", "")
-                    }
+                    seasons_map[season_id] = {"season_id": season_id, "name": ep.get("season_name", "Season " + str(season_id)), "episodes": [], "cmd": ep.get("cmd", "")}
                 seasons_map[season_id]["episodes"].append(ep.get("episode_num", ep.get("number", 0)))
             seasons = list(seasons_map.values())
             json_mgr.update_series_episodes(sid, seasons)
-
     return True
 
 
@@ -1378,12 +1194,11 @@ def run_f3_step(client, json_mgr):
         result = client.fetch(params)
         data = result.get("_data")
         if data:
-            js = data.get('js', {}) if isinstance(data, dict) else {}
-            if js is True or (isinstance(js, dict) and js.get('result') in (True, 'true', 1)):
+            js = data.get("js", {}) if isinstance(data, dict) else {}
+            if js is True or (isinstance(js, dict) and js.get("result") in (True, "true", 1)):
                 print("  -> [OK] Unlocked with PIN {}!".format(pin))
                 unlocked = True
                 break
-
     if unlocked:
         safe_name = "type_itv_action_set_parental_lock_UNLOCKED"
         fname = save_json(data, "F3", safe_name)
@@ -1401,7 +1216,7 @@ def run_f3_step(client, json_mgr):
         }
         safe_name = "type_itv_action_set_parental_lock_ERROR"
         filename = "temp/F3_{}.json".format(safe_name)
-        with open(filename, 'w', encoding='utf-8') as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(error_data, f, indent=2, ensure_ascii=False)
         print("  -> Saved error to {}".format(filename))
         return True
@@ -1417,10 +1232,10 @@ def scan_existing_sessions():
     sessions = []
     for f in files:
         basename = os.path.basename(f)
-        if re.match(r'^[A-Z]\d+_', basename):
+        if re.match(r"^[A-Z]\d+_", basename):
             continue
         try:
-            with open(f, 'r', encoding='utf-8') as file:
+            with open(f, "r", encoding="utf-8") as file:
                 data = json.load(file)
             meta = data.get("_meta", {})
             portal = meta.get("portal", "unknown")
@@ -1467,7 +1282,6 @@ def show_resume_menu(sessions):
 
 def main():
     sessions = scan_existing_sessions()
-
     portal = None
     mac = None
     json_mgr = None
@@ -1482,7 +1296,7 @@ def main():
                 idx = int(choice) - 1
                 if 0 <= idx < len(sessions):
                     session = sessions[idx]
-                    with open(session["file"], 'r', encoding='utf-8') as f:
+                    with open(session["file"], "r", encoding="utf-8") as f:
                         data = json.load(f)
                     portal = data["_meta"].get("portal", "")
                     mac = data["_meta"].get("mac", "")
@@ -1502,15 +1316,12 @@ def main():
         print("=" * 60)
         portal = input("\nPortal URL (e.g., http://example.com or http://ip:port): ").strip()
         mac = input("MAC Address (e.g., 00:1A:79:XX:XX:XX): ").strip()
-
         if not portal or not mac:
             print("[!] Both portal URL and MAC address are required.")
             return
-
-        if not re.match(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$', mac):
+        if not re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac):
             print("[!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
             return
-
         os.makedirs("temp", exist_ok=True)
         json_mgr = JSONManager(portal, mac)
         json_mgr.set_meta(portal, mac)
@@ -1521,20 +1332,16 @@ def main():
     print("\n[Handshake] Using: {}".format(client.locked_url))
     handshake_result = client.handshake()
     handshake_data = handshake_result.get("_data")
-
     status = handshake_result.get("_status")
     url = handshake_result.get("_url")
     error_msg = handshake_result.get("_error")
     lockedpath = handshake_result.get("_lockedpath")
-
     print("  Status: {}, URL: {}".format(status, url))
-
     if not client.token:
         print("[!] Handshake failed — no token received.")
         fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath)
         print("  -> Saved error to {}".format(fname))
         return
-
     print("  [OK] Token received.")
     save_json(handshake_data, "A1", "handshake")
     print("  -> Saved to temp/A1_handshake.json")
@@ -1544,25 +1351,18 @@ def main():
     for i, (sec_key, code, desc, info, is_auto) in enumerate(FLAT_STEPS):
         if i == 0:  # A1 already done above
             continue
-
         if i < resume_idx:
             continue
-
         print_section_status(i, json_mgr)
-
         if json_mgr.is_done(code) or json_mgr.is_ignored(code):
             continue
-
         ignored = prompt_continue(code, info, desc)
-
         if ignored:
             json_mgr.mark_ignored(code)
             print("  -> Ignored.")
             input("  Press Enter to continue to next step...")
             continue
-
         success = False
-
         if is_auto:
             success = run_auto_fetch_step(client, json_mgr, code, desc)
         elif code in ("C5", "D4", "E5"):
@@ -1575,14 +1375,12 @@ def main():
             fname = json_mgr.save()
             print("  -> [OK] Consolidated JSON saved to {}".format(fname))
             success = True
-
         if success:
             json_mgr.mark_done(code)
             print("  -> [OK] Step complete.")
         else:
             print("  -> [!] Step failed. Marking as done, continuing...")
             json_mgr.mark_done(code)
-
         if code != "G1":
             input("  Press Enter to continue to next step...")
 
@@ -1593,5 +1391,5 @@ def main():
     print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
