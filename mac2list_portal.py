@@ -31,28 +31,28 @@ SECTIONS = {
             ("B3", "type=account_info&action=get_tariff_plans", "Subscription plans", True),
         ]
     },
-    "Categories": {
-        "title": "Categories",
+        "Live Channels": {
+        "title": "Live Channels",
         "items": [
             ("C2", "type=itv&action=get_genres", "Channel categories", True),
-            ("D1", "type=vod&action=get_categories", "VOD categories", True),
-            ("E1", "type=series&action=get_categories", "Series categories", True),
+            ("C5", "type=itv&action=get_ordered_list", "Channels by genre (all pages)", False),
+            ("C4", "type=itv&action=create_link", "Resolve live stream URL", False),
         ]
     },
-    "Items": {
-        "title": "Items",
+    "VOD Movies": {
+        "title": "VOD Movies",
         "items": [
-            ("C5", "type=itv&action=get_ordered_list", "Channels by genre (all pages)", False),
+            ("D1", "type=vod&action=get_categories", "VOD categories", True),
             ("D4", "type=vod&action=get_ordered_list", "VOD by category (all pages)", False),
+            ("D3", "type=vod&action=create_link", "Resolve VOD stream URL", False),
+        ]
+    },
+    "Series": {
+        "title": "Series",
+        "items": [
+            ("E1", "type=series&action=get_categories", "Series categories", True),
             ("E5", "type=series&action=get_ordered_list", "Series by category (all pages)", False),
             ("E3", "type=series&action=get_ordered_list&movie_id=...", "Episodes list", False),
-        ]
-    },
-    "Resolve": {
-        "title": "Resolve Link",
-        "items": [
-            ("C4", "type=itv&action=create_link", "Resolve live stream URL", False),
-            ("D3", "type=vod&action=create_link", "Resolve VOD stream URL", False),
             ("E4", "type=vod&action=create_link&series=N", "Resolve episode stream URL", False),
         ]
     },
@@ -902,141 +902,126 @@ def _fetch_single_category(client, json_mgr, section, cat_id, action_type, actio
 # ============================================================
 # ITEMS HANDLER - opens viewer directly, no sub-menu
 # ============================================================
-def run_items_step(client, json_mgr):
-    """Handle Items section. Opens viewer for first pending item, returns to menu after."""
-    item_map = [
-        ("C5", "live", "Channels by genre"),
-        ("D4", "movies", "VOD by category"),
-        ("E5", "series", "Series by category"),
-        ("E3", None, "Episodes list"),
-    ]
-    # Find first pending item
-    for code, section, name in item_map:
-        if not json_mgr.is_done(code) and not json_mgr.is_ignored(code):
-            if code == "E3":
-                return run_episodes_step(client, json_mgr)
-            else:
-                return batch_fetch_section(client, json_mgr, section)
-    return True
-
 def run_episodes_step(client, json_mgr):
-    """Fetch episodes for selected series."""
-    series_items = []
-    for cat in json_mgr.data["series"].get("categories", []):
-        for item in cat.get("items", []):
-            series_items.append(item)
-    if not series_items:
-        print("  No series available. Fetch series first.")
-        input("  Press Enter to continue...")
-        return False
+    """Fetch episodes for selected series. Loops until user presses Done."""
+    while True:  # <-- OUTER LOOP ADDED
+        series_items = []
+        for cat in json_mgr.data["series"].get("categories", []):
+            for item in cat.get("items", []):
+                series_items.append(item)
+        if not series_items:
+            print("  No series available. Fetch series first.")
+            input("  Press Enter to continue...")
+            return False
 
-    # Show list view
-    page_size = 20
-    page = 0
-    total = len(series_items)
-    max_page = (total - 1) // page_size
+        # Show list view
+        page_size = 20
+        page = 0
+        total = len(series_items)
+        max_page = (total - 1) // page_size
 
-    while True:
-        clear_screen()
-        print("=" * 60)
-        print("   Available Series — Page {}/{}".format(page + 1, max_page + 1))
-        print("=" * 60)
-        print()
-        print("  {:<4} {:<15} {:<40}".format("#", "ID", "Name"))
-        print("  " + "-" * 60)
-        start = page * page_size
-        end = min(start + page_size, total)
-        for i in range(start, end):
-            item = series_items[i]
-            sid = str(item.get("id", ""))[:13]
-            name = item.get("name", item.get("title", "Unknown"))[:38]
-            print("  {:<4} {:<15} {:<40}".format(i + 1, sid, name))
-        print()
-        print("  [A] Fetch ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
-        choice = input("  > ").strip().upper()
-        if choice == "A":
-            to_fetch = series_items[:]
-            break
-        elif choice == "D":
-            return "done"
-        elif choice == "":
-            if page < max_page:
-                page += 1
-            else:
-                page = 0
-        else:
-            nums = []
-            for part in re.split(r"[,\s]+", choice):
-                part = part.strip()
-                if part.isdigit():
-                    n = int(part)
-                    if 1 <= n <= total:
-                        nums.append(n)
-            if nums:
-                seen = set()
-                to_fetch = []
-                for n in nums:
-                    item = series_items[n - 1]
-                    if item["id"] not in seen:
-                        to_fetch.append(item)
-                        seen.add(item["id"])
+        while True:
+            clear_screen()
+            print("=" * 60)
+            print("   Available Series — Page {}/{}".format(page + 1, max_page + 1))
+            print("=" * 60)
+            print()
+            print("  {:<4} {:<15} {:<40}".format("#", "ID", "Name"))
+            print("  " + "-" * 60)
+            start = page * page_size
+            end = min(start + page_size, total)
+            for i in range(start, end):
+                item = series_items[i]
+                sid = str(item.get("id", ""))[:13]
+                name = item.get("name", item.get("title", "Unknown"))[:38]
+                print("  {:<4} {:<15} {:<40}".format(i + 1, sid, name))
+            print()
+            print("  [A] Fetch ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
+            choice = input("  > ").strip().upper()
+            if choice == "A":
+                to_fetch = series_items[:]
                 break
+            elif choice == "D":
+                return "done"
+            elif choice == "":
+                if page < max_page:
+                    page += 1
+                else:
+                    page = 0
+            else:
+                nums = []
+                for part in re.split(r"[,\s]+", choice):
+                    part = part.strip()
+                    if part.isdigit():
+                        n = int(part)
+                        if 1 <= n <= total:
+                            nums.append(n)
+                if nums:
+                    seen = set()
+                    to_fetch = []
+                    for n in nums:
+                        item = series_items[n - 1]
+                        if item["id"] not in seen:
+                            to_fetch.append(item)
+                            seen.add(item["id"])
+                    break
 
-    if not to_fetch:
-        return False
+        if not to_fetch:
+            continue  # <-- Changed from return False to continue
 
-    print()
-    print("  Fetching episodes for {} series...".format(len(to_fetch)))
-    for i, item in enumerate(to_fetch):
-        sid = item.get("id", "")
-        name = item.get("name", item.get("title", "Unknown"))
-        print("  [{}/{}] {} (ID: {})".format(i + 1, len(to_fetch), name[:30], sid))
-        params = {
-            "type": "series", "action": "get_ordered_list",
-            "movie_id": sid, "season_id": "0", "episode_id": "0",
-            "row": "0", "JsHttpRequest": "1-xml"
-        }
-        result = client.fetch(params)
-        # Save as simple "episodes.json"
-        data = result.get("_data")
-        if data:
-            with open("temp/episodes.json", "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            fname = "temp/episodes.json"
-            is_error = False
-        else:
-            fname = "temp/episodes_ERROR.json"
-            is_error = True
-        
-        if not is_error:
+        print()
+        print("  Fetching episodes for {} series...".format(len(to_fetch)))
+        for i, item in enumerate(to_fetch):
+            sid = item.get("id", "")
+            name = item.get("name", item.get("title", "Unknown"))
+            print("  [{}/{}] {} (ID: {})".format(i + 1, len(to_fetch), name[:30], sid))
+            params = {
+                "type": "series", "action": "get_ordered_list",
+                "movie_id": sid, "season_id": "0", "episode_id": "0",
+                "row": "0", "JsHttpRequest": "1-xml"
+            }
+            result = client.fetch(params)
+            # Save as simple "episodes.json"
             data = result.get("_data")
-            if data and isinstance(data, dict):
-                js = data.get("js", {})
-                items = js.get("data", []) if isinstance(js, dict) else []
-                
-                # Each item is a Season with episodes in "series" array
-                seasons = []
-                for season_item in items:
-                    season_id = season_item.get("id", "")
-                    season_name = season_item.get("name", "Unknown")
-                    episodes_list = season_item.get("series", [])
-                    season_cmd = season_item.get("cmd", "")
+            if data:
+                with open("temp/episodes.json", "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                fname = "temp/episodes.json"
+                is_error = False
+            else:
+                fname = "temp/episodes_ERROR.json"
+                is_error = True
             
-                    seasons.append({
-                        "season_id": season_id,
-                        "name": season_name,
-                        "episodes": episodes_list,
-                        "cmd": season_cmd
-                    })
-        
-                # Update the series item in consolidated JSON
-                json_mgr.update_series_episodes(sid, seasons)
-            print("    -> [OK] Saved to {} and consolidated JSON".format(fname))
-        else:
-            print("    -> [!] Failed — saved error to {}".format(fname))
-        time.sleep(0.3)
-    print("  -> [OK] Episodes fetched for {} series.".format(len(to_fetch)))
-    return True
+            if not is_error:
+                data = result.get("_data")
+                if data and isinstance(data, dict):
+                    js = data.get("js", {})
+                    items = js.get("data", []) if isinstance(js, dict) else []
+                    
+                    # Each item is a Season with episodes in "series" array
+                    seasons = []
+                    for season_item in items:
+                        season_id = season_item.get("id", "")
+                        season_name = season_item.get("name", "Unknown")
+                        episodes_list = season_item.get("series", [])
+                        season_cmd = season_item.get("cmd", "")
+                
+                        seasons.append({
+                            "season_id": season_id,
+                            "name": season_name,
+                            "episodes": episodes_list,
+                            "cmd": season_cmd
+                        })
+            
+                    # Update the series item in consolidated JSON
+                    json_mgr.update_series_episodes(sid, seasons)
+                print("    -> [OK] Saved to {} and consolidated JSON".format(fname))
+            else:
+                print("    -> [!] Failed — saved error to {}".format(fname))
+            time.sleep(0.3)
+        print("  -> [OK] Episodes fetched for {} series.".format(len(to_fetch)))
+        input("\n  Press Enter to continue...")
+        continue  # <-- LOOP BACK TO SERIES PICKER
 
 def batch_fetch_section(client, json_mgr, section):
     """Main batch fetch loop for a section. Auto-shows viewer. Blocks until all done or ignored."""
@@ -1302,145 +1287,140 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
         print("  -> [OK] Resolved {} items.".format(len(to_resolve)))
         input("\n  Press Enter to continue...")
 
+
 def _resolve_episodes(client, json_mgr, step_code):
-    """E4: Resolve Series Episodes. Handles 'series_id:season_num' ID format."""
-
-    # 1. Collect ONLY series that have episodes fetched (from Step E3)
-    series_items = []
-    for cat in json_mgr.data["series"].get("categories", []):
-        for s in cat.get("items", []):
-            seasons = s.get("seasons", [])
-            # Only keep the series if it has at least one season with episodes
-            if seasons and any(season.get("episodes") for season in seasons):
-                series_items.append(s)
-            
-    if not series_items:
-        print("  No series with episodes available. Fetch episodes (Step E3) first.")
-        input("  Press Enter to continue...")
-        return False
-
-    # 2. Season picker - show episodes count from "series" array
-    page_size = 20
-    page = 0
-    total = len(series_items)
-    max_page = (total - 1) // page_size
-    selected_item = None
-
+    """E4: Series -> Episodes -> Resolve. Loops until user presses Done."""
     while True:
-        clear_screen()
-        print("=" * 60)
-        print("   Select Season — Page {}/{}".format(page + 1, max_page + 1))
-        print("=" * 60)
-        print()
-        
-        print("  {:<4} {:<15} {:<30} {:<10}".format("#", "ID", "Name", "Episodes"))
-        print("  " + "-" * 60)
-        start = page * page_size
-        end = min(start + page_size, total)
-        for i in range(start, end):
-            item = series_items[i]
-            sid = str(item.get("id", ""))[:13]
-            name = item.get("name", item.get("title", "Unknown"))[:28]
-            total_eps = sum(len(s.get("episodes", [])) for s in item.get("seasons", [])) if "seasons" in item else 0
-            print("  {:<4} {:<15} {:<30} {:<10}".format(i + 1, sid, name, total_eps))
-        print()
-        print("  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
-        choice = input("  > ").strip().upper()
-        if choice == "D":
-            return True
-        elif choice == "":
-            page = (page + 1) if page < max_page else 0
-        else:
-            nums = []
-            for part in re.split(r"[,\s]+", choice):
-                part = part.strip()
-                if part.isdigit():
-                    n = int(part)
-                    if 1 <= n <= total:
-                        nums.append(n)
-            if nums:
-                selected_item = series_items[nums[0] - 1]
-                break
 
-    if not selected_item:
-        return False
+        # 1. Collect ONLY series that have episodes fetched (from Step E3)
+        series_items = []
+        for cat in json_mgr.data["series"].get("categories", []):
+            for s in cat.get("items", []):
+                seasons = s.get("seasons", [])
+                # Only keep the series if it has at least one season with episodes
+                if seasons and any(season.get("episodes") for season in seasons):
+                    series_items.append(s)
 
-    # 3. Get episodes from the "seasons" array (nested structure from E3)
-    seasons = selected_item.get("seasons", [])
-    if not seasons:
-        print("  No seasons available for this series.")
-        input("  Press Enter to continue...")
-        return False
+        if not series_items:
+            print("  No series available. Fetch series first.")
+            input("  Press Enter to continue...")
+            return False
 
-    # Flatten all episodes from all seasons
-    episodes = []
-    for season in seasons:
-        season_name = season.get("name", "Unknown")
-        season_cmd = season.get("cmd", "")
-        for ep_num in season.get("episodes", []):
-            episodes.append({
-                "season_name": season_name,
-                "episode_num": ep_num,
-                "cmd": season_cmd
-            })
+        # 2. Series picker
+        page_size = 20
+        page = 0
+        total = len(series_items)
+        max_page = (total - 1) // page_size
+        selected_series = None
 
-    if not episodes:
-        print("  No episodes found.")
-        input("  Press Enter to continue...")
-        return False
-
-    # 4. Auto-resolve ALL episodes (no picker)
-    to_resolve = episodes[:]
-    print()
-    print("  -> Auto-resolving ALL {} episodes...".format(len(to_resolve)))
-
-    # 5. Resolve episodes
-
-    print()
-    print("  Resolving {} episodes...".format(len(to_resolve)))
-    for i, ep_dict in enumerate(to_resolve):
-        ep_num = ep_dict["episode_num"]
-        s_name = ep_dict["season_name"]
-        cmd = ep_dict["cmd"]
-        
-        print("  [{}/{}] {} - Episode {}".format(i + 1, len(to_resolve), s_name, ep_num))
-        
-        params = {
-            "type": "vod", "action": "create_link", "cmd": cmd,
-            "series": str(ep_num),
-            "forced_storage": "undefined", "disable_ad": "0",
-            "download": "0", "JsHttpRequest": "1-xml"
-        }
-        result = client.fetch(params)
-        data = result.get("_data")
-        
-        if data and isinstance(data, dict):
-            js_val = data.get("js")
-            if isinstance(js_val, str):
-                resolved_url = js_val
-            elif isinstance(js_val, dict):
-                resolved_url = js_val.get("cmd", "")
+        while True:
+            clear_screen()
+            print("=" * 60)
+            print("   Select Season — Page {}/{}".format(page + 1, max_page + 1))
+            print("=" * 60)
+            print()
+            print("  {:<4} {:<15} {:<30} {:<10}".format("#", "ID", "Name", "Episodes"))
+            print("  " + "-" * 60)
+            start = page * page_size
+            end = min(start + page_size, total)
+            for i in range(start, end):
+                item = series_items[i]
+                sid = str(item.get("id", ""))[:13]
+                name = item.get("name", item.get("title", "Unknown"))[:28]
+                total_eps = sum(len(s.get("episodes", [])) for s in item.get("seasons", [])) if "seasons" in item else 0
+                print("  {:<4} {:<15} {:<30} {:<10}".format(i + 1, sid, name, total_eps))
+            print()
+            print("  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
+            choice = input("  > ").strip().upper()
+            if choice == "D":
+                return True
+            elif choice == "":
+                page = (page + 1) if page < max_page else 0
             else:
-                resolved_url = ""
-            
-            if resolved_url:
-                # Inject directly into the correct season inside the selected item
-                for season in selected_item.get("seasons", []):
-                    if season.get("name") == s_name:
-                        season["resolved_ep_{}".format(ep_num)] = resolved_url
-                        break
-                json_mgr.save()
-                print("    -> [OK] Saved to main JSON")
+                nums = []
+                for part in re.split(r"[,\s]+", choice):
+                    part = part.strip()
+                    if part.isdigit():
+                        n = int(part)
+                        if 1 <= n <= total:
+                            nums.append(n)
+                if nums:
+                    selected_item = series_items[nums[0] - 1]
+                    break
+
+        if not selected_item:
+            return False
+
+        # 3. Get episodes from the "seasons" array (nested structure from E3)
+        seasons = selected_item.get("seasons", [])
+        if not seasons:
+            print("  No seasons available for this series.")
+            input("  Press Enter to continue...")
+            continue
+
+        # Flatten all episodes from all seasons
+        episodes = []
+        for season in seasons:
+            season_name = season.get("name", "Unknown")
+            season_cmd = season.get("cmd", "")
+            for ep_num in season.get("episodes", []):
+                episodes.append({
+                    "season_name": season_name,
+                    "episode_num": ep_num,
+                    "cmd": season_cmd
+                })
+
+        if not episodes:
+            print("  No episodes found.")
+            input("  Press Enter to continue...")
+            continue
+
+        # 4. Auto-resolve ALL episodes (no picker)
+        to_resolve = episodes[:]
+        print()
+        print("  -> Auto-resolving ALL {} episodes...".format(len(to_resolve)))
+
+        # 5. Resolve episodes
+        print()
+        print("  Resolving {} episodes...".format(len(to_resolve)))
+        for i, ep_dict in enumerate(to_resolve):
+            ep_num = ep_dict["episode_num"]
+            s_name = ep_dict["season_name"]
+            cmd = ep_dict["cmd"]
+            print("  [{}/{}] {} - Episode {}".format(i + 1, len(to_resolve), s_name, ep_num))
+            params = {
+                "type": "vod", "action": "create_link", "cmd": cmd,
+                "series": str(ep_num),
+                "forced_storage": "undefined", "disable_ad": "0",
+                "download": "0", "JsHttpRequest": "1-xml"
+            }
+            result = client.fetch(params)
+            data = result.get("_data")
+            if data and isinstance(data, dict):
+                js_val = data.get("js")
+                if isinstance(js_val, str):
+                    resolved_url = js_val
+                elif isinstance(js_val, dict):
+                    resolved_url = js_val.get("cmd", "")
+                else:
+                    resolved_url = ""
+                if resolved_url:
+                    # Inject directly into the correct season inside the selected item
+                    for season in selected_item.get("seasons", []):
+                        if season.get("name") == s_name:
+                            season["resolved_ep_{}".format(ep_num)] = resolved_url
+                            break
+                    json_mgr.save()
+                    print("    -> [OK] Saved to main JSON")
+                else:
+                    print("    -> [!] No URL in response")
             else:
-                print("    -> [!] No URL in response")
-        else:
-            print("    -> [!] Failed to resolve")
-            
-        time.sleep(0.3)
-        
-    print("  -> [OK] Finished resolving.")
-    input("\n  Press Enter to continue...")
-    return True
+                print("    -> [!] Failed to resolve")
+            time.sleep(0.3)
+        print("  -> [OK] Finished resolving.")
+        input("\nPress Enter to continue...")
+        continue  # <-- THIS LOOPS BACK TO THE SERIES PICKER
+
 
 def run_resolve_step_auto(client, json_mgr, step_code):
     """Resolve links by picking from list view. No manual cmd entry."""
@@ -1460,58 +1440,6 @@ def run_resolve_step_auto(client, json_mgr, step_code):
         return _resolve_episodes(client, json_mgr, step_code)
     else:
         return False
-
-def run_resolve_step(client, json_mgr, step_code, step_desc):
-    if step_code == "C4":
-        cmd = input("  Enter cmd value for live create_link: ").strip()
-        if not cmd:
-            print("  -> Skipped — no cmd provided.")
-            return True
-        params = {"type": "itv", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-    elif step_code == "D3":
-        cmd = input("  Enter cmd value for VOD create_link: ").strip()
-        if not cmd:
-            print("  -> Skipped — no cmd provided.")
-            return True
-        params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": "", "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-    elif step_code == "E3":
-        sid = input("  Enter series_id (movie_id) for episode list: ").strip()
-        if not sid:
-            print("  -> Skipped — no series_id provided.")
-            return True
-        params = {"type": "series", "action": "get_ordered_list", "movie_id": sid, "season_id": "0", "episode_id": "0", "row": "0", "JsHttpRequest": "1-xml"}
-    elif step_code == "E4":
-        cmd = input("  Enter cmd value for episode create_link: ").strip()
-        ep_num = input("  Enter episode number: ").strip() or "1"
-        if not cmd:
-            print("  -> Skipped — no cmd provided.")
-            return True
-        params = {"type": "vod", "action": "create_link", "cmd": cmd, "series": ep_num, "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
-    else:
-        return True
-
-    result = client.fetch(params)
-    safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
-    fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
-    if is_error:
-        print("  -> [!] Failed — saved error to {}".format(fname))
-        return True
-    print("  -> [OK] Saved to {}".format(fname))
-    if step_code == "E3":
-        data = result.get("_data")
-        if data and isinstance(data, dict):
-            js = data.get("js", {})
-            items = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
-            sid = params.get("movie_id", "")
-            seasons_map = {}
-            for ep in items:
-                season_id = ep.get("season_id", "0")
-                if season_id not in seasons_map:
-                    seasons_map[season_id] = {"season_id": season_id, "name": ep.get("season_name", "Season " + str(season_id)), "episodes": [], "cmd": ep.get("cmd", "")}
-                seasons_map[season_id]["episodes"].append(ep.get("episode_num", ep.get("number", 0)))
-            seasons = list(seasons_map.values())
-            json_mgr.update_series_episodes(sid, seasons)
-    return True
 
 def run_f3_step(client, json_mgr):
     pins = ["0000", "1234", "3333"]
@@ -1682,61 +1610,6 @@ def main():
         # Show banner
         print_section_status(i, json_mgr)
 
-        # Items section: sub-loop handles all pending items with merged prompt
-        if code in ("C5", "D4", "E5", "E3"):
-            items_map = [
-                ("C5", "live", "Channels by genre"),
-                ("D4", "movies", "VOD by category"),
-                ("E5", "series", "Series by category"),
-                ("E3", None, "Episodes list"),
-            ]
-            for item_code, item_section, item_name in items_map:
-                if json_mgr.is_done(item_code) or json_mgr.is_ignored(item_code):
-                    continue
-                # Find flat index for this item
-                item_idx = next((j for j, (_, c, _, _, _) in enumerate(FLAT_STEPS) if c == item_code), 0)
-                while True:
-                    clear_screen()
-                    print_section_status(item_idx, json_mgr)
-                    next_idx = item_idx + 1
-                    if next_idx < len(FLAT_STEPS):
-                        next_info = FLAT_STEPS[next_idx][3]
-                        print("  -> [NEXT] {}".format(next_info))
-                    print("\n[Enter] Open list  [I]gnore  [Q]uit")
-                    choice = input("  > ").strip().upper()
-                    if choice == "Q":
-                        print("  Quitting...")
-                        sys.exit(0)
-                    if choice == "I":
-                        json_mgr.mark_ignored(item_code)
-                        print("  -> Ignored.")
-                        break
-                    # User pressed Enter — open viewer
-                    result = None
-                    if item_code == "C5":
-                        result = batch_fetch_section(client, json_mgr, "live")
-                    elif item_code == "D4":
-                        result = batch_fetch_section(client, json_mgr, "movies")
-                    elif item_code == "E5":
-                        result = batch_fetch_section(client, json_mgr, "series")
-                    elif item_code == "E3":
-                        result = run_episodes_step(client, json_mgr)
-                    if result == "back":
-                        continue
-                    elif result == "done":
-                        json_mgr.mark_done(item_code)
-                        print("  -> [OK] Marked as done.")
-                        break
-                    elif result:
-                        json_mgr.mark_done(item_code)
-                        print("  -> [OK] Step complete.")
-                        break
-                    else:
-                        print("  -> [!] Step failed. Marking as done, continuing...")
-                        json_mgr.mark_done(item_code)
-                        break
-            continue
-
         # Non-Items steps: do work immediately, then prompt
         success = False
         if is_auto:
@@ -1752,6 +1625,35 @@ def main():
                 print("  -> Ignored.")
                 continue
             success = run_resolve_step_auto(client, json_mgr, code)
+
+        elif code in ("C5", "D4", "E5"):
+            print("\n[Enter] Open list  [I]gnore  [Q]uit")
+            choice = input("  > ").strip().upper()
+            if choice == "Q":
+                print("  Quitting...")
+                sys.exit(0)
+            if choice == "I":
+                json_mgr.mark_ignored(code)
+                print("  -> Ignored.")
+                continue
+            if code == "C5":
+                success = batch_fetch_section(client, json_mgr, "live")
+            elif code == "D4":
+                success = batch_fetch_section(client, json_mgr, "movies")
+            elif code == "E5":
+                success = batch_fetch_section(client, json_mgr, "series")
+        elif code == "E3":
+            print("\n[Enter] Open list  [I]gnore  [Q]uit")
+            choice = input("  > ").strip().upper()
+            if choice == "Q":
+                print("  Quitting...")
+                sys.exit(0)
+            if choice == "I":
+                json_mgr.mark_ignored(code)
+                print("  -> Ignored.")
+                continue
+            success = run_episodes_step(client, json_mgr)
+
         elif code == "F3":
             success = run_f3_step(client, json_mgr)
         elif code == "G1":
