@@ -1304,14 +1304,18 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
 
 def _resolve_episodes(client, json_mgr, step_code):
     """E4: Resolve Series Episodes. Handles 'series_id:season_num' ID format."""
-    # 1. Collect all series (seasons)
+
+    # 1. Collect ONLY series that have episodes fetched (from Step E3)
     series_items = []
     for cat in json_mgr.data["series"].get("categories", []):
         for s in cat.get("items", []):
-            series_items.append(s)
+            seasons = s.get("seasons", [])
+            # Only keep the series if it has at least one season with episodes
+            if seasons and any(season.get("episodes") for season in seasons):
+                series_items.append(s)
             
     if not series_items:
-        print("  No series available. Fetch series first.")
+        print("  No series with episodes available. Fetch episodes (Step E3) first.")
         input("  Press Enter to continue...")
         return False
 
@@ -1381,67 +1385,17 @@ def _resolve_episodes(client, json_mgr, step_code):
             })
 
     if not episodes:
-        print("  No episodes found in seasons.")
+        print("  No episodes found.")
         input("  Press Enter to continue...")
         return False
 
-    # 4. Episode picker
-    page_size = 20
-    page = 0
-    total_ep = len(episodes)
-    max_page = (total_ep - 1) // page_size
-    to_resolve = []
+    # 4. Auto-resolve ALL episodes (no picker)
+    to_resolve = episodes[:]
+    print()
+    print("  -> Auto-resolving ALL {} episodes...".format(len(to_resolve)))
 
-    while True:
-        clear_screen()
-        print("=" * 60)
-        print("   {} — Episodes — Page {}/{}".format(
-            selected_item.get("name", "Unknown")[:30],
-            page + 1, max_page + 1))
-        print("=" * 60)
-        print()
-        print("  {:<4} {:<15} {:<10} {:<20}".format("#", "Season", "Episode", "Cmd"))
-        print("  " + "-" * 60)
-        start = page * page_size
-        end = min(start + page_size, total_ep)
-        for i in range(start, end):
-            ep_dict = episodes[i]
-            s_name = ep_dict["season_name"][:13]
-            ep_num = ep_dict["episode_num"]
-            cmd_preview = ep_dict["cmd"][:20] if ep_dict["cmd"] else "no cmd"
-            print("  {:<4} {:<15} {:<10} {:<20}".format(i + 1, s_name, ep_num, cmd_preview))
-        print()
-        print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
-        choice = input("  > ").strip().upper()
-        if choice == "A":
-            to_resolve = episodes[:]
-            break
-        elif choice == "D":
-            return True
-        elif choice == "":
-            page = (page + 1) if page < max_page else 0
-        else:
-            nums = []
-            for part in re.split(r"[,\s]+", choice):
-                part = part.strip()
-                if part.isdigit():
-                    n = int(part)
-                    if 1 <= n <= total_ep:
-                        nums.append(n)
-            if nums:
-                seen = set()
-                for n in nums:
-                    ep_dict = episodes[n - 1]
-                    ep_key = "{}_{}".format(ep_dict["season_name"], ep_dict["episode_num"])
-                    if ep_key not in seen:
-                        to_resolve.append(ep_dict)
-                        seen.add(ep_key)
-                break
+    # 5. Resolve episodes
 
-    if not to_resolve:
-        return False
-
-    # 5. Resolve episodes and inject into main JSON
     print()
     print("  Resolving {} episodes...".format(len(to_resolve)))
     for i, ep_dict in enumerate(to_resolve):
