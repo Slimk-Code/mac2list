@@ -1768,9 +1768,67 @@ def main():
         # Show banner
         print_section_status(i, json_mgr)
 
-        # Items steps: prompt first, then open viewer
+        # Items section: sub-loop handles all pending items with merged prompt
         if code in ("C5", "D4", "E5", "E3"):
-            print("\n  [Enter] Open viewer  [I]gnore  [Q]uit")
+            items_map = [
+                ("C5", "live", "Channels by genre"),
+                ("D4", "movies", "VOD by category"),
+                ("E5", "series", "Series by category"),
+                ("E3", None, "Episodes list"),
+            ]
+            for item_code, item_section, item_name in items_map:
+                if json_mgr.is_done(item_code) or json_mgr.is_ignored(item_code):
+                    continue
+                # Find flat index for this item
+                item_idx = next((j for j, (_, c, _, _, _) in enumerate(FLAT_STEPS) if c == item_code), 0)
+                while True:
+                    clear_screen()
+                    print_section_status(item_idx, json_mgr)
+                    next_idx = item_idx + 1
+                    if next_idx < len(FLAT_STEPS):
+                        next_info = FLAT_STEPS[next_idx][3]
+                        print("  -> [NEXT] {}".format(next_info))
+                    print("\n  [Enter] Open list  [I]gnore  [Q]uit")
+                    choice = input("  > ").strip().upper()
+                    if choice == "Q":
+                        print("  Quitting...")
+                        sys.exit(0)
+                    if choice == "I":
+                        json_mgr.mark_ignored(item_code)
+                        print("  -> Ignored.")
+                        break
+                    # User pressed Enter — open viewer
+                    result = None
+                    if item_code == "C5":
+                        result = batch_fetch_section(client, json_mgr, "live")
+                    elif item_code == "D4":
+                        result = batch_fetch_section(client, json_mgr, "movies")
+                    elif item_code == "E5":
+                        result = batch_fetch_section(client, json_mgr, "series")
+                    elif item_code == "E3":
+                        result = run_episodes_step(client, json_mgr)
+                    if result == "back":
+                        continue
+                    elif result == "done":
+                        json_mgr.mark_done(item_code)
+                        print("  -> [OK] Marked as done.")
+                        break
+                    elif result:
+                        json_mgr.mark_done(item_code)
+                        print("  -> [OK] Step complete.")
+                        break
+                    else:
+                        print("  -> [!] Step failed. Marking as done, continuing...")
+                        json_mgr.mark_done(item_code)
+                        break
+            continue
+
+        # Non-Items steps: do work immediately, then prompt
+        success = False
+        if is_auto:
+            success = run_auto_fetch_step(client, json_mgr, code, desc)
+        elif code in ("C4", "D3", "E4"):
+            print("\n  [Enter] Open list  [I]gnore  [Q]uit")
             choice = input("  > ").strip().upper()
             if choice == "Q":
                 print("  Quitting...")
@@ -1779,53 +1837,6 @@ def main():
                 json_mgr.mark_ignored(code)
                 print("  -> Ignored.")
                 continue
-
-            # User pressed Enter — open viewer
-            result = None
-            if code == "C5":
-                result = batch_fetch_section(client, json_mgr, "live")
-            elif code == "D4":
-                result = batch_fetch_section(client, json_mgr, "movies")
-            elif code == "E5":
-                result = batch_fetch_section(client, json_mgr, "series")
-            elif code == "E3":
-                result = run_episodes_step(client, json_mgr)
-
-            if result == "back":
-                # User chose back from viewer — step stays pending, return to menu
-                clear_screen()
-                print_section_status(i, json_mgr)
-                input("  Press Enter to continue...")
-                continue
-            elif result == "done":
-                # User chose Done from viewer — mark step as done, return to menu
-                json_mgr.mark_done(code)
-                print("  -> [OK] Marked as done.")
-            elif result:
-                json_mgr.mark_done(code)
-                print("  -> [OK] Step complete.")
-            else:
-                print("  -> [!] Step failed. Marking as done, continuing...")
-                json_mgr.mark_done(code)
-
-            # Clear screen and show clean menu before prompting
-            clear_screen()
-            print_section_status(i, json_mgr)
-
-            # Show next step info
-            next_idx = i + 1
-            if next_idx < len(FLAT_STEPS):
-                next_info = FLAT_STEPS[next_idx][3]
-                print("  -> [NEXT] {}".format(next_info))
-
-            input("  Press Enter to continue...")
-            continue
-
-        # Non-Items steps: do work immediately, then prompt
-        success = False
-        if is_auto:
-            success = run_auto_fetch_step(client, json_mgr, code, desc)
-        elif code in ("C4", "D3", "E4"):
             success = run_resolve_step_auto(client, json_mgr, code)
         elif code == "F3":
             success = run_f3_step(client, json_mgr)
