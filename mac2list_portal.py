@@ -721,7 +721,6 @@ def probe_categories(client, json_mgr, section):
             wildcard = cat
             break
     if wildcard:
-        print("\nProbing wildcard '*' for grand total...")
         params = {"type": action_type, "action": action, id_key: "*", "p": "1", "JsHttpRequest": "1-xml"}
         result = client.fetch(params)
         data = result.get("_data")
@@ -730,9 +729,8 @@ def probe_categories(client, json_mgr, section):
             if isinstance(js, dict):
                 grand_total = js.get("total_items") or 0
                 grand_fn(grand_total)
-                print("  -> Grand total: {} items".format(grand_total))
+                print("  -> total Channels: {} items".format(grand_total))
 
-    print("\nProbing page 1 of {} {} categories...".format(total, section))
     probed = 0
     for cat in cats:
         cat_id = str(cat.get("id", ""))
@@ -748,7 +746,7 @@ def probe_categories(client, json_mgr, section):
                 cat["total_items"] = total_items
                 mark_fn(cat_id)
                 probed += 1
-                progress_bar(probed, total - 1, prefix="  Probing: ")
+                progress_bar(probed, total - 1, prefix="  Loading Categories: ")
                 time.sleep(0.3)
     print()
     json_mgr.save()
@@ -764,7 +762,7 @@ def view_categories(json_mgr, section, client=None):
         all_cats = json_mgr.data["live"].get("categories", [])
         fetched = set(json_mgr.get_live_fetched())
         failed = set(json_mgr.get_live_failed())
-        title = "Live Channel Categories"
+        title = "Live Categories"
     elif section == "movies":
         all_cats = json_mgr.data["movies"].get("categories", [])
         fetched = set(json_mgr.get_movie_fetched())
@@ -778,12 +776,17 @@ def view_categories(json_mgr, section, client=None):
     else:
         return []
 
-    # Only show pending categories
-    cats = [c for c in all_cats if str(c.get("id")) != "*" and str(c.get("id")) not in fetched and str(c.get("id")) not in failed]
+    # Build display list: pending first, then fetched, then failed
+    pending = [c for c in all_cats if str(c.get("id")) != "*" and str(c.get("id")) not in fetched and str(c.get("id")) not in failed]
+    fetched_list = [c for c in all_cats if str(c.get("id")) != "*" and str(c.get("id")) in fetched]
+    failed_list = [c for c in all_cats if str(c.get("id")) != "*" and str(c.get("id")) in failed]
+    cats = pending + fetched_list + failed_list
+    total_pending = len(pending)
     total = len(cats)
-    if total == 0:
+    if total_pending == 0:
         print("  No pending categories to fetch.")
         return []
+    
 
     page_size = 20
     page = 0
@@ -793,24 +796,30 @@ def view_categories(json_mgr, section, client=None):
     while True:
         clear_screen()
         print("=" * 60)
-        print("   {} — Page {}/{}".format(title, page + 1, max_page + 1))
-        print("   {} of {} pending categories".format(total, len(all_cats)))
+        print("   {} — Page {}/{} — {} of {} pending".format(title, page + 1, max_page + 1, total_pending, len(all_cats)))
         print("=" * 60)
         print()
-        print("  {:<4} {:<40} {:<10}".format("#", "Name", "Items"))
-        print("  " + "-" * 56)
+
+        print("  {:<4} {:<8} {:<40} {:<10}".format("#", "Status", "Name", "Items"))
+        print("  " + "-" * 64)
         start = page * page_size
         end = min(start + page_size, total)
         for i in range(start, end):
             cat = cats[i]
             name = cat.get("title", cat.get("name", "Unknown"))[:38]
             total_items = cat.get("total_items", 0)
-            print("  {:<4} {:<40} {:<10}".format(i + 1, name, total_items))
+            if i < total_pending:
+                status = "[]"
+            elif i < total_pending + len(fetched_list):
+                status = "[x]"
+            else:
+                status = "[!]"
+            print("  {:<4} {:<8} {:<40} {:<10}".format(i + 1, status, name, total_items))
         print()
         print("  [Enter] Next page  |  [A] Fetch ALL  |  [1-{}] Select #  |  [D] Done".format(end - start))
         choice = input("  > ").strip().upper()
         if choice == "A":
-            to_fetch_ids = [str(c.get("id")) for c in cats]
+            to_fetch_ids = [str(c.get("id")) for c in pending]
             break
         elif choice == "D":
             return "done"
@@ -830,12 +839,14 @@ def view_categories(json_mgr, section, client=None):
                         nums.append(n)
             if nums:
                 seen = set()
+                to_fetch_ids = []
                 for n in nums:
-                    cat = cats[n - 1]
-                    cid = str(cat.get("id", ""))
-                    if cid and cid not in seen:
-                        to_fetch_ids.append(cid)
-                        seen.add(cid)
+                    if 1 <= n <= total and n <= total_pending:
+                        cat = cats[n - 1]
+                        cid = str(cat.get("id", ""))
+                        if cid and cid not in seen:
+                            to_fetch_ids.append(cid)
+                            seen.add(cid)
                 break
     return to_fetch_ids
 
@@ -1138,7 +1149,7 @@ def print_section_status(current_step_idx, json_mgr):
     print("-" * 60)
 
 def prompt_continue():
-    print("\n  -> [Enter] Continue  [I]gnore  [Q]uit\n\n\n")
+    print("\n\n\n  -> [Enter] Continue  [I]gnore  [Q]uit\n")
     choice = input("  > ").strip().upper()
     if choice == "Q":
         print("  Quitting...")
@@ -1200,30 +1211,44 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
 
     page_size = 20
     page = 0
-    total = len(items)
-    max_page = (total - 1) // page_size
+    to_resolve = []
 
     while True:
+        # Recalculate pending/resolved each time we redraw
+        pending = [it for it in items if not it.get("resolved_url")]
+        resolved = [it for it in items if it.get("resolved_url")]
+        items = pending + resolved
+        total_pending = len(pending)
+        total = len(items)
+        max_page = (total - 1) // page_size
+        if total_pending == 0:
+            print("  All items already resolved.")
+            input("  Press Enter to continue...")
+            return True
+
         clear_screen()
         print("=" * 60)
-        print("   {} — Page {}/{}".format(title, page + 1, max_page + 1))
+        print("   {} — Page {}/{} — {} of {} pending".format(title, page + 1, max_page + 1, total_pending, total))
         print("=" * 60)
         print()
-        print("  {:<4} {:<40} {:<10}".format("#", "Name", "ID"))
-        print("  " + "-" * 56)
+        print("  {:<4} {:<8} {:<40} {:<10}".format("#", "Status", "Name", "ID"))
+        print("  " + "-" * 64)
         start = page * page_size
         end = min(start + page_size, total)
         for i in range(start, end):
             item = items[i]
             name = item.get("name", item.get("title", "Unknown"))[:38]
             cid = str(item.get("id", ""))[:8]
-            resolved_mark = "✓" if item.get("resolved_url") else " "
-            print("  {:<4} {:<40} {:<10} {}".format(i + 1, name, cid, resolved_mark))
+            if i < total_pending:
+                status = "[]"
+            else:
+                status = "[x]"
+            print("  {:<4} {:<8} {:<40} {:<10}".format(i + 1, status, name, cid))
         print()
         print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
         choice = input("  > ").strip().upper()
         if choice == "A":
-            to_resolve = items[:]
+            to_resolve = pending[:]
         elif choice == "D":
             return True
         elif choice == "":
@@ -1244,10 +1269,11 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
                 seen = set()
                 to_resolve = []
                 for n in nums:
-                    item = items[n - 1]
-                    if item["id"] not in seen:
-                        to_resolve.append(item)
-                        seen.add(item["id"])
+                    if 1 <= n <= total and n <= total_pending:
+                        item = items[n - 1]
+                        if item["id"] not in seen:
+                            to_resolve.append(item)
+                            seen.add(item["id"])
             else:
                 continue
 
