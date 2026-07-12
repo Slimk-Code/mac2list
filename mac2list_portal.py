@@ -205,12 +205,8 @@ class IPTVPortal:
 
         def _fetch_page_thread(p):
             success = self._fetch_single_page(p, params_template, delay, pages, all_data, fetched_items, done_count, failed_pages, lock)
-            if not success:
-                with lock:
-                    fail_msg = "  Page {}/{} FAILED after 3 retries".format(p, pages)
-                    sys.stdout.write(chr(13) + " " * 80 + chr(13))
-                    sys.stdout.write(fail_msg + "\n")
-                    sys.stdout.flush()
+
+        # Failures are collected silently; retry progress shown separately
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(_fetch_page_thread, p) for p in range(2, pages + 1)]
@@ -218,31 +214,7 @@ class IPTVPortal:
                 future.result()
 
         recovered_pages = []
-        still_failed = []
-        if failed_pages:
-            print("  Retrying {} failed page(s)...".format(len(failed_pages)))
-            for p in failed_pages:
-                p_params = dict(params_template)
-                p_params["p"] = str(p)
-                recovered = False
-                for attempt in range(3):
-                    page_result = self._get(p_params)
-                    page_data = page_result.get("_data", {})
-                    if page_data and isinstance(page_data, dict):
-                        items = page_data.get("js", {}).get("data", [])
-                        if items:
-                            all_data.extend(items)
-                            fetched_items[0] += len(items)
-                            recovered_pages.append(p)
-                            print("    Page {}/{} retry OK ({} items)".format(p, pages, len(items)))
-                            recovered = True
-                            break
-                    if attempt < 2:
-                        time.sleep(delay * 2)
-                if not recovered:
-                    still_failed.append(p)
-                    print("    Page {}/{} retry FAILED".format(p, pages))
-        failed_pages = still_failed
+        still_failed = failed_pages  # Retry deferred to caller
 
         merged = dict(data)
         merged_js = dict(js)
@@ -762,7 +734,7 @@ def view_categories(json_mgr, section, client=None):
         all_cats = json_mgr.data["live"].get("categories", [])
         fetched = set(json_mgr.get_live_fetched())
         failed = set(json_mgr.get_live_failed())
-        title = "Live Categories"
+        title = "Fetch Channels"
     elif section == "movies":
         all_cats = json_mgr.data["movies"].get("categories", [])
         fetched = set(json_mgr.get_movie_fetched())
@@ -783,8 +755,8 @@ def view_categories(json_mgr, section, client=None):
     cats = pending + fetched_list + failed_list
     total_pending = len(pending)
     total = len(cats)
-    if total_pending == 0:
-        print("  No pending categories to fetch.")
+    if total == 0:
+        print("  No categories available.")
         return []
     
 
@@ -816,11 +788,18 @@ def view_categories(json_mgr, section, client=None):
                 status = "[!]"
             print("  {:<4} {:<8} {:<40} {:<10}".format(i + 1, status, name, total_items))
         print()
-        print("  [Enter] Next page  |  [A] Fetch ALL  |  [1-{}] Select #  |  [D] Done".format(end - start))
+        if total_pending == 0:
+            print("  -> [OK] All categories fetched. {} done, {} failed.".format(len(fetched), len(failed)))
+            print()
+            print("  [Enter] Next page  |  [D] Done")
+        else:
+            print("  [Enter] Next page  |  [A] Fetch ALL  |  [1-{}] Select #  |  [D] Done".format(end - start))
         choice = input("  > ").strip().upper()
         if choice == "A":
-            to_fetch_ids = [str(c.get("id")) for c in pending]
-            break
+            if total_pending > 0:
+                to_fetch_ids = [str(c.get("id")) for c in pending]
+                break
+            # else: ignore when nothing pending
         elif choice == "D":
             return "done"
         elif choice == "":
@@ -829,7 +808,7 @@ def view_categories(json_mgr, section, client=None):
             else:
                 page = 0
         else:
-            # Parse multiple numbers (comma, space, or mixed)
+            # Parse multiple numbers
             nums = []
             for part in re.split(r"[,\s]+", choice):
                 part = part.strip()
@@ -837,16 +816,15 @@ def view_categories(json_mgr, section, client=None):
                     n = int(part)
                     if 1 <= n <= total:
                         nums.append(n)
-            if nums:
+            if nums and total_pending > 0:
                 seen = set()
                 to_fetch_ids = []
                 for n in nums:
-                    if 1 <= n <= total and n <= total_pending:
-                        cat = cats[n - 1]
-                        cid = str(cat.get("id", ""))
-                        if cid and cid not in seen:
-                            to_fetch_ids.append(cid)
-                            seen.add(cid)
+                    cat = cats[n - 1]
+                    cid = str(cat.get("id", ""))
+                    if cid and cid not in seen:
+                        to_fetch_ids.append(cid)
+                        seen.add(cid)
                 break
     return to_fetch_ids
 
@@ -867,7 +845,7 @@ def _clear_batch_counter():
     sys.stdout.flush()
 
 def _fetch_single_category(client, json_mgr, section, cat_id, action_type, action, id_key):
-    """Fetch one category and update json_mgr. Returns (success, items_count)."""
+    """Fetch one category and update json_mgr. Returns (success, items_count, failed_pages)."""
     params = {"type": action_type, "action": action, id_key: cat_id, "p": "1", "JsHttpRequest": "1-xml"}
     if action_type == "vod" or action_type == "series":
         params["fav"] = "0"
@@ -875,6 +853,7 @@ def _fetch_single_category(client, json_mgr, section, cat_id, action_type, actio
         params["hd"] = "0"
     result = client.fetch_all_pages(params)
     data = result.get("_data")
+    failed_pages = []
     if data and isinstance(data, dict):
         # Save full response to temp file
         if section == "live":
@@ -893,20 +872,21 @@ def _fetch_single_category(client, json_mgr, section, cat_id, action_type, actio
         if isinstance(js, dict):
             items = js.get("data", [])
             total_items = js.get("total_items") or len(items)
+            failed_pages = js.get("_failed_pages", [])
             if section == "live":
                 json_mgr.update_live_channels(cat_id, items, total_items)
             elif section == "movies":
                 json_mgr.update_movie_items(cat_id, items, total_items)
             elif section == "series":
                 json_mgr.update_series_items(cat_id, items, total_items)
-            return True, total_items
+            return True, total_items, failed_pages, params
     if section == "live":
         json_mgr.mark_live_genre_failed(cat_id)
     elif section == "movies":
         json_mgr.mark_movie_category_failed(cat_id)
     elif section == "series":
         json_mgr.mark_series_category_failed(cat_id)
-    return False, 0
+    return False, 0, [], params
 
 # ============================================================
 # ITEMS SUB-MENU
@@ -1071,37 +1051,84 @@ def batch_fetch_section(client, json_mgr, section):
         fetched = set(get_fetched())
         failed = set(get_failed())
         remaining = [cid for cid in all_ids if cid not in fetched and cid not in failed]
-        if not remaining:
-            _clear_batch_counter()
-            print("  [OK] All {} categories fetched. {} done, {} failed.".format(section_name.lower(), len(fetched), len(failed)))
-            return True
 
-        # Auto-show viewer with only pending categories
+        # Auto-show viewer — even when all done, so user can see final state
         to_fetch = view_categories(json_mgr, section, client)
         if to_fetch == "done":
-            # User pressed D (Done) — mark step as done, return to main menu
-            _clear_batch_counter()
             return "done"
         if not to_fetch:
-            # No categories selected (shouldn't happen now)
-            _clear_batch_counter()
-            print("  -> No categories selected.")
             return True
 
         # Fetch selected categories
         print()
         done_count = len(fetched)
         fail_count = len(failed)
+        total_failed_pages = 0
+        retry_queue = []  # [(params_template, page_numbers, cat_id, section)]
         for i, cid in enumerate(to_fetch):
-            progress_bar(i + 1, len(to_fetch), prefix="  Fetching: ")
-            ok, _ = _fetch_single_category(client, json_mgr, section, cid, action_type, action, id_key)
+            ok, _, failed_pages, p_template = _fetch_single_category(client, json_mgr, section, cid, action_type, action, id_key)
             if ok:
                 done_count += 1
+                if failed_pages:
+                    total_failed_pages += len(failed_pages)
+                    retry_queue.append((p_template, failed_pages, cid, section))
             else:
                 fail_count += 1
+            # Update progress bar with failed page count
+            line = "  Fetching: [{}/{}] done".format(i + 1, len(to_fetch))
+            if total_failed_pages:
+                line += "  |  {} pages failed".format(total_failed_pages)
+            sys.stdout.write(chr(13) + line.ljust(80))
+            sys.stdout.flush()
             time.sleep(0.1)
         _clear_batch_counter()
-        print("  -> [OK] {} fetched.".format(len(to_fetch)))
+        print("  -> [OK] {} fetched. {} pages failed across {} categories.".format(len(to_fetch), total_failed_pages, len(retry_queue)))
+
+        # Phase 2: Deferred retry of all failed pages
+        if retry_queue:
+            all_retry_pages = sum(len(pages) for _, pages, _, _ in retry_queue)
+            retry_done = 0
+            retry_ok = 0
+            retry_still_failed = 0
+            for p_template, page_numbers, cat_id, sec in retry_queue:
+                for p in page_numbers:
+                    p_params = dict(p_template)
+                    p_params["p"] = str(p)
+                    recovered = False
+                    for attempt in range(3):
+                        page_result = client._get(p_params)
+                        page_data = page_result.get("_data", {})
+                        if page_data and isinstance(page_data, dict):
+                            items = page_data.get("js", {}).get("data", [])
+                            if items:
+                                # Append to existing category in JSON manager
+                                if sec == "live":
+                                    existing = json_mgr.data["live"]["categories"]
+                                elif sec == "movies":
+                                    existing = json_mgr.data["movies"]["categories"]
+                                elif sec == "series":
+                                    existing = json_mgr.data["series"]["categories"]
+                                for cat in existing:
+                                    if str(cat.get("id")) == str(cat_id):
+                                        if sec == "live":
+                                            cat["channels"].extend([trim_channel(ch) for ch in items])
+                                        elif sec == "movies":
+                                            cat["items"].extend([trim_movie(m) for m in items])
+                                        elif sec == "series":
+                                            cat["items"].extend([trim_series_item(s) for s in items])
+                                        break
+                                json_mgr.save()
+                                retry_ok += 1
+                                recovered = True
+                                break
+                        if attempt < 2:
+                            time.sleep(0.5 * 2)
+                    retry_done += 1
+                    if not recovered:
+                        retry_still_failed += 1
+                    progress_bar(retry_done, all_retry_pages, prefix="  Retrying: ")
+            print("  |  {} OK, {} still failed".format(retry_ok, retry_still_failed))
+
         # Loop back — auto-refresh viewer with updated pending list
 
 # ============================================================
@@ -1149,7 +1176,7 @@ def print_section_status(current_step_idx, json_mgr):
     print("-" * 60)
 
 def prompt_continue():
-    print("\n\n\n  -> [Enter] Continue  [I]gnore  [Q]uit\n")
+    print("\n\n\n [Enter] Continue  [I]gnore  [Q]uit\n")
     choice = input("  > ").strip().upper()
     if choice == "Q":
         print("  Quitting...")
@@ -1221,20 +1248,21 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
         total_pending = len(pending)
         total = len(items)
         max_page = (total - 1) // page_size
-        if total_pending == 0:
-            print("  All items already resolved.")
+        if total == 0:
+            print("  No items available.")
             input("  Press Enter to continue...")
             return True
 
         clear_screen()
         print("=" * 60)
-        print("   {} — Page {}/{} — {} of {} pending".format(title, page + 1, max_page + 1, total_pending, total))
+        print("   {} — Page {}/{} — {} of {} pending".format("Resolve Link", page + 1, max_page + 1, total_pending, total))
         print("=" * 60)
         print()
         print("  {:<4} {:<8} {:<40} {:<10}".format("#", "Status", "Name", "ID"))
         print("  " + "-" * 64)
         start = page * page_size
         end = min(start + page_size, total)
+        displayed_resolved_header = False
         for i in range(start, end):
             item = items[i]
             name = item.get("name", item.get("title", "Unknown"))[:38]
@@ -1242,15 +1270,24 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
             if i < total_pending:
                 status = "[]"
             else:
+                if not displayed_resolved_header:
+                    print("\n  --- Already resolved ({}) ---\n".format(len(resolved)))
+                    displayed_resolved_header = True
                 status = "[x]"
             print("  {:<4} {:<8} {:<40} {:<10}".format(i + 1, status, name, cid))
         print()
-        print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
+        if total_pending == 0:
+            print("  -> [OK] All items resolved. {}/{} items.".format(len(resolved), total))
+            print()
+            print("  [Enter] Next page  |  [D] Done")
+        else:
+            print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
         choice = input("  > ").strip().upper()
         if choice == "A":
-            to_resolve = pending[:]
+            if total_pending > 0:
+                to_resolve = pending[:]
         elif choice == "D":
-            return True
+            return "done"
         elif choice == "":
             if page < max_page:
                 page += 1
@@ -1265,15 +1302,14 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
                     n = int(part)
                     if 1 <= n <= total:
                         nums.append(n)
-            if nums:
+            if nums and total_pending > 0:
                 seen = set()
                 to_resolve = []
                 for n in nums:
-                    if 1 <= n <= total and n <= total_pending:
-                        item = items[n - 1]
-                        if item["id"] not in seen:
-                            to_resolve.append(item)
-                            seen.add(item["id"])
+                    item = items[n - 1]
+                    if item["id"] not in seen:
+                        to_resolve.append(item)
+                        seen.add(item["id"])
             else:
                 continue
 
@@ -1281,13 +1317,12 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
             continue
 
         print()
-        print("  Resolving {} items...".format(len(to_resolve)))
+        fail_count = 0
         for i, item in enumerate(to_resolve):
             name = item.get("name", item.get("title", "Unknown"))
-            print("  [{}/{}] {}".format(i + 1, len(to_resolve), name[:40]))
             cmd = item.get("cmd", "")
             if not cmd:
-                print("    -> [!] No cmd available.")
+                fail_count += 1
                 continue
             params = {"type": action_type, "action": "create_link", "cmd": cmd, "series": "",
                       "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
@@ -1301,19 +1336,30 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
                     resolved_url = js_val.get("cmd")
                 else:
                     resolved_url = None
-
                 if resolved_url:
                     item["resolved_url"] = resolved_url
                     json_mgr.save()
-                    print("    -> [OK] Resolved and saved to main JSON")
                 else:
-                    print("    -> [!] No URL in response")
+                    fail_count += 1
             else:
-                print("    -> [!] Failed to resolve")
+                fail_count += 1
+            # Inline progress bar with failed count
+            pct = ((i + 1) / len(to_resolve)) * 100
+            filled = int(30 * (i + 1) / len(to_resolve))
+            bar = "=" * filled + "-" * (30 - filled)
+            line = "  Resolving: [{}] {:5.1f}% ({}/{})".format(bar, pct, i + 1, len(to_resolve))
+            if fail_count:
+                line += "  |  {} failed".format(fail_count)
+            sys.stdout.write(chr(13) + line.ljust(80))
+            sys.stdout.flush()
             time.sleep(0.3)
-        
-        print("  -> [OK] Resolved {} items.".format(len(to_resolve)))
-        input("\n  Press Enter to continue...")
+
+        print()
+        if fail_count:
+            print("  -> [OK] Resolved {}/{} items. {} failed.".format(len(to_resolve) - fail_count, len(to_resolve), fail_count))
+        else:
+            print("  -> [OK] Resolved {}/{} items.".format(len(to_resolve), len(to_resolve)))
+        time.sleep(0.5)
 
 
 def _resolve_episodes(client, json_mgr, step_code):
@@ -1681,18 +1727,19 @@ def main():
         if success:
             json_mgr.mark_done(code)
             # Clear and redraw with updated menu before showing step output
+            print("\033[2J\033[H", end="")
+            print_section_status(i + 1, json_mgr)
             if step_msg:
-                print("\033[2J\033[H", end="")
-                print_section_status(i + 1, json_mgr)
                 print(step_msg)
             print("  -> [OK] Step complete.")
         else:
             json_mgr.mark_done(code)
+            print("\033[2J\033[H", end="")
+            print_section_status(i + 1, json_mgr)
             if step_msg:
-                print("\033[2J\033[H", end="")
-                print_section_status(i + 1, json_mgr)
                 print(step_msg)
             print("  -> [!] Step failed. Marking as done, continuing...")
+        
 
         # Show [NEXT] with next step's info
         next_idx = i + 1
