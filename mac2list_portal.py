@@ -378,8 +378,9 @@ class JSONManager:
         done = self.data["_meta"].get("done_steps", [])
         if step_code not in done:
             done.append(step_code)
-        self.data["_meta"]["done_steps"] = done
-        self.update_last_step(step_code)
+            self.data["_meta"]["done_steps"] = done
+            self.update_last_step(step_code)
+            self.save()
 
     def mark_ignored(self, step_code):
         ignored = self.data["_meta"].get("ignored_steps", [])
@@ -1110,20 +1111,22 @@ def print_section_status(current_step_idx, json_mgr):
         done_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
         ignored_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_ignored(code))
         total_count = len(sec["items"])
+
         if is_current_section:
             print("  {}. {}  ({}/{} done)".format(sec_num, sec["title"], done_count, total_count))
-            for code, desc, info, _ in sec["items"]:
+            for j, (code, desc, info, _) in enumerate(sec["items"]):
                 if json_mgr.is_done(code):
                     mark = "[x]"
                 elif json_mgr.is_ignored(code):
                     mark = "[I]"
-                elif flat_idx == current_step_idx:
+                elif flat_idx + j == current_step_idx:
                     mark = "[>]"
                 else:
                     mark = "[ ]"
                 print("    {} {:<50} {}".format(mark, desc, info))
-            flat_idx += 1
+            flat_idx += len(sec["items"])
         else:
+
             status = ""
             if done_count == total_count:
                 status = " [all done]"
@@ -1135,7 +1138,7 @@ def print_section_status(current_step_idx, json_mgr):
     print("-" * 60)
 
 def prompt_continue():
-    print("\n[Enter] Continue  [I]gnore  [Q]uit")
+    print("\n  -> [Enter] Continue  [I]gnore  [Q]uit\n\n\n")
     choice = input("  > ").strip().upper()
     if choice == "Q":
         print("  Quitting...")
@@ -1148,14 +1151,13 @@ def prompt_continue():
 def run_auto_fetch_step(client, json_mgr, step_code, step_desc):
     params = STEP_PARAMS.get(step_code)
     if not params:
-        return False
+        return False, ""
     result = client.fetch(params)
     safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
     fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
     if is_error:
-        print("  -> [!] Failed — saved error to {}".format(fname))
-        return False
-    print("  -> [OK] Saved to {}".format(fname))
+        return False, "  -> [!] Failed — saved error to {}".format(fname)
+    msg = "  -> [OK] Saved to {}".format(fname)
     data = result.get("_data")
     if data and isinstance(data, dict):
         js = data.get("js", {})
@@ -1175,7 +1177,7 @@ def run_auto_fetch_step(client, json_mgr, step_code, step_desc):
             cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
             json_mgr.update_series_categories(cats)
             probe_categories(client, json_mgr, "series")
-    return True
+    return True, msg
 
 def run_batch_step(client, json_mgr, step_code):
     if step_code == "C5":
@@ -1444,24 +1446,25 @@ def run_resolve_step_auto(client, json_mgr, step_code):
 def run_f3_step(client, json_mgr):
     pins = ["0000", "1234", "3333"]
     unlocked = False
+    msg = ""
     for pin in pins:
-        print("\nTrying PIN {} ...".format(pin))
+        msg += "\nTrying PIN {} ...".format(pin)
         params = {"type": "itv", "action": "set_parental_lock", "password": pin, "JsHttpRequest": "1-xml"}
         result = client.fetch(params)
         data = result.get("_data")
         if data:
             js = data.get("js", {}) if isinstance(data, dict) else {}
             if js is True or (isinstance(js, dict) and js.get("result") in (True, "true", 1)):
-                print("  -> [OK] Unlocked with PIN {}!".format(pin))
+                msg += "\n  -> [OK] Unlocked with PIN {}!".format(pin)
                 unlocked = True
                 break
     if unlocked:
         safe_name = "type_itv_action_set_parental_lock_UNLOCKED"
         fname = save_json(data, "F3", safe_name)
-        print("  -> Saved to {}".format(fname))
-        return True
+        msg += "\n  -> Saved to {}".format(fname)
+        return True, msg
     else:
-        print("  -> [-] All PINs failed (0000, 1234, 3333)")
+        msg += "\n  -> [-] All PINs failed (0000, 1234, 3333)"
         error_data = {
             "_error": True,
             "_timestamp": datetime.now().isoformat(),
@@ -1474,8 +1477,8 @@ def run_f3_step(client, json_mgr):
         filename = "temp/F3_{}.json".format(safe_name)
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(error_data, f, indent=2, ensure_ascii=False)
-        print("  -> Saved error to {}".format(filename))
-        return True
+        msg += "\n  -> Saved error to {}".format(filename)
+        return True, msg
 
 # ============================================================
 # RESUME / STARTUP
@@ -1537,6 +1540,7 @@ def main():
     mac = None
     json_mgr = None
     resume_idx = 0
+    is_restored = False
 
     if sessions:
         choice = show_resume_menu(sessions)
@@ -1554,9 +1558,7 @@ def main():
                     json_mgr = JSONManager(portal, mac)
                     json_mgr.data = data
                     resume_idx = json_mgr.get_resume_index()
-                    print("\n[OK] Resuming session: {} | {}".format(portal, mac))
-                    print("  Last step: {}".format(data["_meta"].get("last_step", "none")))
-                    input("  Press Enter to continue...")
+                    is_restored = True
             except:
                 pass
 
@@ -1580,6 +1582,8 @@ def main():
     client = IPTVPortal(portal, mac)
 
     # Handshake always runs
+
+    handshake_summary = ""
     print("\n[Handshake] Using: {}".format(client.locked_url))
     handshake_result = client.handshake()
     handshake_data = handshake_result.get("_data")
@@ -1593,10 +1597,12 @@ def main():
         fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath)
         print("  -> Saved error to {}".format(fname))
         return
-    print("  [OK] Token received.")
+
+    handshake_summary = "  [Handshake] Using: {}\n  Status: {}, URL: {}\n  [OK] Token received.\n  -> Saved to temp/A1_handshake.json".format(client.locked_url, status, url)
+    print(handshake_summary)
     save_json(handshake_data, "A1", "handshake")
-    print("  -> Saved to temp/A1_handshake.json")
     json_mgr.mark_done("A1")
+    resume_idx = json_mgr.get_resume_index()
 
     # Linear flow through all sections
     for i, (sec_key, code, desc, info, is_auto) in enumerate(FLAT_STEPS):
@@ -1610,32 +1616,27 @@ def main():
         # Show banner
         print_section_status(i, json_mgr)
 
-        # Non-Items steps: do work immediately, then prompt
-        success = False
-        if is_auto:
-            success = run_auto_fetch_step(client, json_mgr, code, desc)
-        elif code in ("C4", "D3", "E4"):
-            print("\n[Enter] Open list  [I]gnore  [Q]uit")
-            choice = input("  > ").strip().upper()
-            if choice == "Q":
-                print("  Quitting...")
-                sys.exit(0)
-            if choice == "I":
+        # Resume pause: don't auto-run on first step after resume
+        if i == resume_idx:
+            if is_restored:
+                print("  -> [OK] Session restored successfully")
+            ignored = prompt_continue()
+            if ignored:
                 json_mgr.mark_ignored(code)
                 print("  -> Ignored.")
                 continue
-            success = run_resolve_step_auto(client, json_mgr, code)
 
+            # Clean screen before executing so it looks like a fresh step
+            print_section_status(i, json_mgr)
+
+        # Execute step
+        success = False
+        step_msg = ""
+        if is_auto:
+            success, step_msg = run_auto_fetch_step(client, json_mgr, code, desc)
+        elif code in ("C4", "D3", "E4"):
+            success = run_resolve_step_auto(client, json_mgr, code)
         elif code in ("C5", "D4", "E5"):
-            print("\n[Enter] Open list  [I]gnore  [Q]uit")
-            choice = input("  > ").strip().upper()
-            if choice == "Q":
-                print("  Quitting...")
-                sys.exit(0)
-            if choice == "I":
-                json_mgr.mark_ignored(code)
-                print("  -> Ignored.")
-                continue
             if code == "C5":
                 success = batch_fetch_section(client, json_mgr, "live")
             elif code == "D4":
@@ -1643,44 +1644,44 @@ def main():
             elif code == "E5":
                 success = batch_fetch_section(client, json_mgr, "series")
         elif code == "E3":
-            print("\n[Enter] Open list  [I]gnore  [Q]uit")
-            choice = input("  > ").strip().upper()
-            if choice == "Q":
-                print("  Quitting...")
-                sys.exit(0)
-            if choice == "I":
-                json_mgr.mark_ignored(code)
-                print("  -> Ignored.")
-                continue
             success = run_episodes_step(client, json_mgr)
-
         elif code == "F3":
-            success = run_f3_step(client, json_mgr)
+            success, step_msg = run_f3_step(client, json_mgr)
         elif code == "G1":
             fname = json_mgr.save()
-            print("  -> [OK] Consolidated JSON saved to {}".format(fname))
+            step_msg = "  -> [OK] Consolidated JSON saved to {}".format(fname)
             success = True
 
         if success:
             json_mgr.mark_done(code)
+            # Clear and redraw with updated menu before showing step output
+            if step_msg:
+                print("\033[2J\033[H", end="")
+                print_section_status(i + 1, json_mgr)
+                print(step_msg)
             print("  -> [OK] Step complete.")
         else:
-            print("  -> [!] Step failed. Marking as done, continuing...")
             json_mgr.mark_done(code)
+            if step_msg:
+                print("\033[2J\033[H", end="")
+                print_section_status(i + 1, json_mgr)
+                print(step_msg)
+            print("  -> [!] Step failed. Marking as done, continuing...")
 
         # Show [NEXT] with next step's info
         next_idx = i + 1
         if next_idx < len(FLAT_STEPS):
-            next_desc = FLAT_STEPS[next_idx][3]
             next_info = FLAT_STEPS[next_idx][3]
             print("  -> [NEXT] {}".format(next_info))
 
-        # After work done, prompt to continue
+        # Prompt after executing
         ignored = prompt_continue()
+
         if ignored:
             json_mgr.mark_ignored(code)
             print("  -> Ignored.")
-            continue  # auto-advance
+            continue
+
 
     print_section_status(len(FLAT_STEPS), json_mgr)
     print("\nAll steps complete!")
