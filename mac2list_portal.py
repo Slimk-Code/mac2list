@@ -72,6 +72,23 @@ SECTIONS = {
     },
 }
 
+# ============================================================
+# HUB FLOW CONSTANTS
+# ============================================================
+SCRAPE_SECTION_KEYS = ["Auth", "Live Channels", "VOD Movies", "Series"]
+SETTINGS_SECTION_KEYS = ["Settings"]
+
+SCRAPE_STEP_CODES = []
+for sec_key in SCRAPE_SECTION_KEYS:
+    for code, _, _, _ in SECTIONS[sec_key]["items"]:
+        SCRAPE_STEP_CODES.append(code)
+
+SETTINGS_STEP_CODES = []
+for sec_key in SETTINGS_SECTION_KEYS:
+    for code, _, _, _ in SECTIONS[sec_key]["items"]:
+        SETTINGS_STEP_CODES.append(code)
+
+
 STEP_PARAMS = {
     "A2": {"type": "stb", "action": "get_profile", "JsHttpRequest": "1-xml"},
     "B1": {"type": "account_info", "action": "get_main_info", "JsHttpRequest": "1-xml"},
@@ -1195,14 +1212,6 @@ def print_section_status(current_step_idx, json_mgr):
     print()
     print("-" * 60)
 
-def prompt_continue():
-    print("\n\n\n [Enter] Continue  [I]gnore  [Q]uit\n")
-    choice = input("  > ").strip().upper()
-    if choice == "Q":
-        print("  Quitting...")
-        sys.exit(0)
-    return choice == "I"
-
 # ============================================================
 # STEP EXECUTORS
 # ============================================================
@@ -1714,41 +1723,131 @@ def scan_existing_sessions():
             pass
     return sessions
 
-def show_resume_menu(sessions):
+STEP_NAME_MAP = {
+    "A1": "Handshake", "A2": "STB Profile",
+    "B1": "Account Main Info", "B2": "Account Details", "B3": "Tariff Plans",
+    "C2": "Live Categories", "C5": "Live Channels", "C4": "Live Resolve",
+    "D1": "VOD Categories", "D4": "VOD Movies", "D3": "VOD Resolve",
+    "E1": "Series Categories", "E5": "Series Items", "E3": "Episodes", "E4": "Series Resolve",
+    "F1": "Portal Settings", "F2": "Parental Lock", "F3": "Unlock Adult",
+    "G1": "Generate JSON",
+}
+
+
+def _human_last_step(last_step):
+    if not last_step:
+        return "Start"
+    name = STEP_NAME_MAP.get(last_step, last_step)
+    return "{} ({})".format(name, last_step)
+
+
+def show_resume_menu(sessions, reveal_new=False, portal="", mac=""):
+    """Display landing page. If reveal_new=True, show Portal/MAC inputs inline."""
     clear_screen()
     print("=" * 60)
     print("   IPTV Portal JSON Extractor v17")
     print("=" * 60)
-    print("\nExisting sessions found:")
     print()
+
+    total_steps = len(FLAT_STEPS)
+
+    # Restore sessions
     for i, s in enumerate(sessions, 1):
-        status = "{} done, {} ignored".format(s["done_count"], s["ignored_count"])
-        if s["last_step"]:
-            status += " | last: {}".format(s["last_step"])
-        print("  [{}] {} | {}".format(i, s["portal"], s["mac"]))
-        print("      {}".format(status))
+        done = s["done_count"]
+        ignored = s["ignored_count"]
+        total_done = done + ignored
+        last = _human_last_step(s.get("last_step", ""))
+        print("  [{}] Restore session".format(i))
+        print("      {}  |  {}".format(s["portal"], s["mac"]))
+        print("      Progress: {}/{} steps  |  Last: {}".format(total_done, total_steps, last))
+        print()
+
+    # New session
+    next_num = len(sessions) + 1
+    print("  [{}] New session".format(next_num))
+
+    # Reveal inputs if requested
+    if reveal_new:
+        print()
+        if portal:
+            print("      Portal URL: {}".format(portal))
+        else:
+            portal = input("      Portal URL: ").strip()
+        if mac:
+            print("      MAC Address: {}".format(mac))
+        else:
+            mac = input("      MAC Address: ").strip()
+        # Auto-return if both inputs are filled — no extra prompt
+        if portal and mac:
+            return "", portal, mac
+
     print()
-    print("  [N] Start new session")
+    print("  [Q] Quit")
     print()
-    choice = input("  Select: ").strip().upper()
-    return choice
+
+    return input("  > ").strip().upper(), portal, mac
 
 # ============================================================
-# MAIN
+# HUB HELPERS
 # ============================================================
-def main():
+def get_step_info(code):
+    """Return (index, sec_key, desc, info, is_auto) for a step code."""
+    for i, (sec_key, c, desc, info, is_auto) in enumerate(FLAT_STEPS):
+        if c == code:
+            return i, sec_key, desc, info, is_auto
+    return None
+
+
+def get_next_pending_step(json_mgr, step_codes):
+    """Return first step code not done and not ignored."""
+    for code in step_codes:
+        if not json_mgr.is_done(code) and not json_mgr.is_ignored(code):
+            return code
+    return None
+
+
+# ============================================================
+# PAGE 1 — RESUME / NEW
+# ============================================================
+def run_resume_or_new():
+    """Page 1: Clean landing with reveal inputs. Returns (portal, mac, json_mgr, is_restored)."""
     sessions = scan_existing_sessions()
     portal = None
     mac = None
     json_mgr = None
-    resume_idx = 0
     is_restored = False
 
-    if sessions:
-        choice = show_resume_menu(sessions)
-        if choice == "N":
-            pass
+    while True:
+        # Phase 1: Show menu, get choice
+        choice, _, _ = show_resume_menu(sessions)
+        new_session_num = str(len(sessions) + 1)
+
+        if choice == "Q":
+            print("  Quitting...")
+            sys.exit(0)
+
+        elif choice == new_session_num:
+            # Phase 2: Reveal inputs on same screen
+            choice2, portal, mac = show_resume_menu(sessions, reveal_new=True)
+            if choice2 == "Q":
+                print("  Quitting...")
+                sys.exit(0)
+            # Validate
+            if not portal or not mac:
+                print("  [!] Both portal URL and MAC address are required.")
+                input("  Press Enter to retry...")
+                continue
+            if not re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac):
+                print("  [!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
+                input("  Press Enter to retry...")
+                continue
+            os.makedirs("temp", exist_ok=True)
+            json_mgr = JSONManager(portal, mac)
+            json_mgr.set_meta(portal, mac)
+            break
+
         else:
+            # Restore session
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(sessions):
@@ -1759,138 +1858,498 @@ def main():
                     mac = data["_meta"].get("mac", "")
                     json_mgr = JSONManager(portal, mac)
                     json_mgr.data = data
-                    resume_idx = json_mgr.get_resume_index()
                     is_restored = True
+                    break
             except:
                 pass
 
-    if not portal or not mac:
+    return portal, mac, json_mgr, is_restored
+
+
+# ============================================================
+# PAGE 2 — MAIN HUB
+# ============================================================
+def show_hub(json_mgr):
+    """Display Main Hub. Returns user choice string."""
+    clear_screen()
+    print("=" * 60)
+    print("   IPTV Portal JSON Extractor v17 — Main Hub")
+    print("=" * 60)
+    print()
+
+    # Scrape progress
+    scrape_done = 0
+    for sec_key in SCRAPE_SECTION_KEYS:
+        sec = SECTIONS[sec_key]
+        if all(json_mgr.is_done(code) or json_mgr.is_ignored(code) for code, _, _, _ in sec["items"]):
+            scrape_done += 1
+    scrape_total = len(SCRAPE_SECTION_KEYS)
+
+    # Watch counts
+    live_count = sum(len(c.get("channels", [])) for c in json_mgr.data["live"].get("categories", []))
+    movie_count = sum(len(c.get("items", [])) for c in json_mgr.data["movies"].get("categories", []))
+    series_count = sum(len(c.get("items", [])) for c in json_mgr.data["series"].get("categories", []))
+
+    # Convert
+    convert_status = "Done" if json_mgr.is_done("G1") else "Ready"
+
+    # Settings
+    settings_done = sum(1 for code in SETTINGS_STEP_CODES if json_mgr.is_done(code))
+    settings_total = len(SETTINGS_STEP_CODES)
+
+    print("  [1] Scrape        —  {}/{} sections complete".format(scrape_done, scrape_total))
+    print("  [2] Watch         —  {} ch, {} movies, {} series".format(live_count, movie_count, series_count))
+    print("  [3] Convert       —  {}".format(convert_status))
+    print("  [4] Settings      —  {}/{} done".format(settings_done, settings_total))
+    print()
+    print("  [Q] Quit")
+    print()
+
+    return input("  > ").strip().upper()
+
+
+def hub_loop(client, json_mgr, is_restored):
+    """Main Hub loop."""
+    if is_restored:
+        print("  -> Session restored")
+        time.sleep(0.3)
+    else:
+        print("  -> New session started")
+        time.sleep(0.3)
+
+    while True:
+        choice = show_hub(json_mgr)
+        if choice == "Q":
+            print("  Quitting...")
+            sys.exit(0)
+        elif choice == "1":
+            run_scrape_submenu(client, json_mgr)
+        elif choice == "2":
+            run_watch_submenu(json_mgr)
+        elif choice == "3":
+            run_convert_submenu(json_mgr)
+        elif choice == "4":
+            run_settings_submenu(client, json_mgr)
+        else:
+            print("  Invalid choice.")
+            time.sleep(0.5)
+
+
+# ============================================================
+# PAGE 3 — SCRAPE SUB-MENU
+# ============================================================
+def print_scrape_submenu(json_mgr):
+    """Display Scrape sub-menu with section picker."""
+    clear_screen()
+    print("=" * 60)
+
+    done_sections = 0
+    for sec_key in SCRAPE_SECTION_KEYS:
+        sec = SECTIONS[sec_key]
+        if all(json_mgr.is_done(code) or json_mgr.is_ignored(code) for code, _, _, _ in sec["items"]):
+            done_sections += 1
+
+    print("   Scrape — {}/{} sections complete".format(done_sections, len(SCRAPE_SECTION_KEYS)))
+    print("=" * 60)
+    print()
+
+    for sec_num, sec_key in enumerate(SCRAPE_SECTION_KEYS, 1):
+        sec = SECTIONS[sec_key]
+        done_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
+        ignored_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_ignored(code))
+        total_count = len(sec["items"])
+
+        if done_count + ignored_count == total_count:
+            status = "[all done]"
+        else:
+            status = "[{}/{} done]".format(done_count, total_count)
+
+        print("  [{}] {} {}".format(sec_num, sec["title"], status))
+
+    print()
+    print("  [Enter] Continue next pending  |  [1-{}] Pick section  |  [B] Back to Hub".format(len(SCRAPE_SECTION_KEYS)))
+
+
+def run_scrape_submenu(client, json_mgr):
+    """Scrape sub-menu loop with section picker."""
+    while True:
+        print_scrape_submenu(json_mgr)
+        choice = input("  > ").strip().upper()
+        if choice == "B":
+            break
+        elif choice == "":
+            next_code = get_next_pending_step(json_mgr, SCRAPE_STEP_CODES)
+            if next_code is None:
+                print("  -> [OK] All scrape steps complete.")
+                input("  Press Enter to continue...")
+            else:
+                idx, sec_key, desc, info, is_auto = get_step_info(next_code)
+                run_single_step(client, json_mgr, next_code, desc, info, is_auto)
+        elif choice.isdigit() and 1 <= int(choice) <= len(SCRAPE_SECTION_KEYS):
+            sec_key = SCRAPE_SECTION_KEYS[int(choice) - 1]
+            run_section_submenu(client, json_mgr, sec_key)
+        else:
+            print("  Invalid choice.")
+            time.sleep(0.5)
+
+def run_section_submenu(client, json_mgr, sec_key):
+    """Mini linear flow for one section (e.g., VOD Movies)."""
+    sec = SECTIONS[sec_key]
+    section_codes = [code for code, _, _, _ in sec["items"]]
+
+    while True:
         clear_screen()
         print("=" * 60)
-        print("   IPTV Portal JSON Extractor v17 — New Session")
+        done_count = sum(1 for code in section_codes if json_mgr.is_done(code))
+        print("   {} — {}/{} done".format(sec["title"], done_count, len(section_codes)))
         print("=" * 60)
-        portal = input("\nPortal URL (e.g., http://example.com or http://ip:port): ").strip()
-        mac = input("MAC Address (e.g., 00:1A:79:XX:XX:XX): ").strip()
-        if not portal or not mac:
-            print("[!] Both portal URL and MAC address are required.")
-            return
-        if not re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac):
-            print("[!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
-            return
-        os.makedirs("temp", exist_ok=True)
-        json_mgr = JSONManager(portal, mac)
-        json_mgr.set_meta(portal, mac)
+        print()
+
+        for j, (code, desc, info, _) in enumerate(sec["items"]):
+            if json_mgr.is_done(code):
+                mark = "[x]"
+            elif json_mgr.is_ignored(code):
+                mark = "[I]"
+            else:
+                mark = "[>]"
+            print("  {} {:<50} {}".format(mark, desc, info))
+
+        print()
+        print("  [Enter] Continue next pending  |  [B] Back to Scrape")
+
+        choice = input("  > ").strip().upper()
+        if choice == "B":
+            break
+        elif choice == "":
+            next_code = get_next_pending_step(json_mgr, section_codes)
+            if next_code is None:
+                print("  -> [OK] All steps in {} complete.".format(sec["title"]))
+                input("  Press Enter to continue...")
+            else:
+                idx, _, desc, info, is_auto = get_step_info(next_code)
+                run_single_step(client, json_mgr, next_code, desc, info, is_auto)
+        else:
+            print("  Invalid choice.")
+            time.sleep(0.5)
+            
+# ============================================================
+# PAGE 3 — SETTINGS SUB-MENU
+# ============================================================
+def print_settings_submenu(json_mgr):
+    """Display Settings sub-menu."""
+    clear_screen()
+    print("=" * 60)
+
+    done_count = sum(1 for code in SETTINGS_STEP_CODES if json_mgr.is_done(code))
+    total = len(SETTINGS_STEP_CODES)
+    print("   Settings — {}/{} done".format(done_count, total))
+    print("=" * 60)
+    print()
+
+    sec = SECTIONS["Settings"]
+    for j, (code, desc, info, _) in enumerate(sec["items"]):
+        if json_mgr.is_done(code):
+            mark = "[x]"
+        elif json_mgr.is_ignored(code):
+            mark = "[I]"
+        else:
+            mark = "[>]"
+        print("  {} {:<50} {}".format(mark, desc, info))
+
+    print()
+    print("  [Enter] Continue next pending  |  [B] Back to Hub")
+
+
+def run_settings_submenu(client, json_mgr):
+    """Settings sub-menu loop."""
+    while True:
+        print_settings_submenu(json_mgr)
+        choice = input("  > ").strip().upper()
+        if choice == "B":
+            break
+        elif choice == "":
+            next_code = get_next_pending_step(json_mgr, SETTINGS_STEP_CODES)
+            if next_code is None:
+                print("  -> [OK] All settings steps complete.")
+                input("  Press Enter to continue...")
+            else:
+                idx, sec_key, desc, info, is_auto = get_step_info(next_code)
+                run_single_step(client, json_mgr, next_code, desc, info, is_auto)
+        else:
+            print("  Invalid choice.")
+            time.sleep(0.5)
+
+
+# ============================================================
+# PAGE 3 — CONVERT
+# ============================================================
+def run_convert_submenu(json_mgr):
+    """Convert action."""
+    clear_screen()
+    print("=" * 60)
+    print("   Convert")
+    print("=" * 60)
+    print()
+
+    if json_mgr.is_done("G1"):
+        print("  -> Consolidated JSON already generated.")
+        print("  -> File: {}".format(json_mgr.filename))
+        print()
+        print("  [R] Regenerate  |  [B] Back to Hub")
+        choice = input("  > ").strip().upper()
+        if choice == "R":
+            fname = json_mgr.save()
+            print("  -> [OK] Regenerated: {}".format(fname))
+            input("  Press Enter to continue...")
+    else:
+        fname = json_mgr.save()
+        print("  -> [OK] Consolidated JSON saved to {}".format(fname))
+        json_mgr.mark_done("G1")
+        input("  Press Enter to continue...")
+
+
+# ============================================================
+# PAGE 3 — WATCH SUB-MENU
+# ============================================================
+def show_watch_submenu(json_mgr):
+    """Display Watch sub-menu."""
+    clear_screen()
+    print("=" * 60)
+    print("   Watch — Browse fetched content")
+    print("=" * 60)
+    print()
+
+    live_count = sum(len(c.get("channels", [])) for c in json_mgr.data["live"].get("categories", []))
+    movie_count = sum(len(c.get("items", [])) for c in json_mgr.data["movies"].get("categories", []))
+    series_count = sum(len(c.get("items", [])) for c in json_mgr.data["series"].get("categories", []))
+
+    print("  [1] Live Channels     —  {} channels".format(live_count))
+    print("  [2] VOD Movies        —  {} movies".format(movie_count))
+    print("  [3] Series            —  {} series".format(series_count))
+    print()
+    print("  [B] Back to Hub")
+
+
+def run_watch_submenu(json_mgr):
+    """Watch sub-menu loop."""
+    while True:
+        show_watch_submenu(json_mgr)
+        choice = input("  > ").strip().upper()
+        if choice == "B":
+            break
+        elif choice == "1":
+            watch_live(json_mgr)
+        elif choice == "2":
+            watch_movies(json_mgr)
+        elif choice == "3":
+            watch_series(json_mgr)
+        else:
+            print("  Invalid choice.")
+            time.sleep(0.5)
+
+
+# ============================================================
+# SINGLE STEP EXECUTOR (no prompts, returns to caller)
+# ============================================================
+def run_single_step(client, json_mgr, code, desc, info, is_auto):
+    """Execute a single step. Returns to caller when done."""
+    print()
+    print("  Executing: {} — {}".format(code, desc))
+    print()
+
+    success = False
+    step_msg = ""
+
+    if is_auto:
+        success, step_msg = run_auto_fetch_step(client, json_mgr, code, desc)
+    elif code in ("C4", "D3", "E4"):
+        success = run_resolve_step_auto(client, json_mgr, code)
+    elif code in ("C5", "D4", "E5"):
+        if code == "C5":
+            success = batch_fetch_section(client, json_mgr, "live")
+        elif code == "D4":
+            success = batch_fetch_section(client, json_mgr, "movies")
+        elif code == "E5":
+            success = batch_fetch_section(client, json_mgr, "series")
+    elif code == "E3":
+        success = run_episodes_step(client, json_mgr)
+    elif code == "F3":
+        success, step_msg = run_f3_step(client, json_mgr)
+    elif code == "G1":
+        fname = json_mgr.save()
+        step_msg = "  -> [OK] Consolidated JSON saved to {}".format(fname)
+        success = True
+
+    if success:
+        json_mgr.mark_done(code)
+        if step_msg:
+            print(step_msg)
+        print("  -> [OK] {} complete.".format(desc))
+    else:
+        json_mgr.mark_done(code)
+        if step_msg:
+            print(step_msg)
+        print("  -> [!] {} failed. Marking as done.".format(desc))
+
+    print()
+    input("  Press Enter to continue...")
+    return success
+
+
+# ============================================================
+# WATCH VIEWERS (read-only, paginated)
+# ============================================================
+def paginated_browse(items, title, headers, row_fmt_fn, page_size=20):
+    """Generic paginated read-only browser."""
+    total = len(items)
+    if total == 0:
+        print("  No items available.")
+        input("  Press Enter to continue...")
+        return
+
+    page = 0
+    max_page = (total - 1) // page_size
+
+    while True:
+        clear_screen()
+        print("=" * 60)
+        print("   {} — Page {}/{} — {} total".format(title, page + 1, max_page + 1, total))
+        print("=" * 60)
+        print()
+
+        header_line = "  " + "  ".join(headers)
+        print(header_line)
+        print("  " + "-" * 64)
+
+        start = page * page_size
+        end = min(start + page_size, total)
+        for i in range(start, end):
+            print(row_fmt_fn(items[i], i + 1))
+
+        print()
+        if max_page > 0:
+            if page < max_page:
+                print("  [Enter] Next page  |  [B] Back")
+            else:
+                print("  [Enter] First page  |  [B] Back")
+        else:
+            print("  [B] Back")
+
+        choice = input("  > ").strip().upper()
+        if choice == "B":
+            break
+        elif choice == "" and max_page > 0:
+            page = (page + 1) % (max_page + 1)
+
+
+def watch_live(json_mgr):
+    """Read-only live channel viewer."""
+    items = []
+    for cat in json_mgr.data["live"].get("categories", []):
+        for ch in cat.get("channels", []):
+            items.append(ch)
+
+    if not items:
+        print("  No channels available. Fetch channels first (Scrape → Live).")
+        input("  Press Enter to continue...")
+        return
+
+    def fmt(item, idx):
+        name = item.get("name", "Unknown")[:34]
+        resolved = item.get("resolved_url", "")
+        status = "[x]" if resolved else "[]"
+        url = resolved[:28] if resolved else "(unresolved)"
+        return "{:<4} {:<6} {:<34} {:<28}".format(idx, status, name, url)
+
+    paginated_browse(items, "Live Channels", ["#", "Status", "Name", "URL"], fmt)
+
+
+def watch_movies(json_mgr):
+    """Read-only movie viewer."""
+    items = []
+    for cat in json_mgr.data["movies"].get("categories", []):
+        for m in cat.get("items", []):
+            items.append(m)
+
+    if not items:
+        print("  No movies available. Fetch movies first (Scrape → VOD).")
+        input("  Press Enter to continue...")
+        return
+
+    def fmt(item, idx):
+        name = item.get("name", "Unknown")[:34]
+        resolved = item.get("resolved_url", "")
+        status = "[x]" if resolved else "[]"
+        url = resolved[:28] if resolved else "(unresolved)"
+        return "{:<4} {:<6} {:<34} {:<28}".format(idx, status, name, url)
+
+    paginated_browse(items, "VOD Movies", ["#", "Status", "Name", "URL"], fmt)
+
+
+def watch_series(json_mgr):
+    """Read-only series viewer."""
+    items = []
+    for cat in json_mgr.data["series"].get("categories", []):
+        for s in cat.get("items", []):
+            items.append(s)
+
+    if not items:
+        print("  No series available. Fetch series first (Scrape → Series).")
+        input("  Press Enter to continue...")
+        return
+
+    def fmt(item, idx):
+        name = item.get("name", "Unknown")[:34]
+        seasons = item.get("seasons", [])
+        total_eps = sum(len(se.get("episodes", [])) for se in seasons)
+        resolved = 0
+        for se in seasons:
+            for ep in se.get("episodes", []):
+                if se.get("resolved_ep_{}".format(ep)):
+                    resolved += 1
+        status = "[x]" if resolved == total_eps and total_eps > 0 else "[]"
+        return "{:<4} {:<6} {:<34} {:>3}/{} eps".format(idx, status, name, resolved, total_eps)
+
+    paginated_browse(items, "Series", ["#", "Status", "Name", "Resolved"], fmt)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    portal, mac, json_mgr, is_restored = run_resume_or_new()
+
+    if not portal or not mac or not json_mgr:
+        return
 
     client = IPTVPortal(portal, mac)
 
-    # Handshake always runs
-
-    handshake_summary = ""
-    print("\n[Handshake] Using: {}".format(client.locked_url))
+    # Handshake always runs (silent in background)
     handshake_result = client.handshake()
     handshake_data = handshake_result.get("_data")
     status = handshake_result.get("_status")
     url = handshake_result.get("_url")
     error_msg = handshake_result.get("_error")
     lockedpath = handshake_result.get("_lockedpath")
-    print("  Status: {}, URL: {}".format(status, url))
     if not client.token:
         print("[!] Handshake failed — no token received.")
         fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath)
         print("  -> Saved error to {}".format(fname))
         return
 
-    handshake_summary = "  [Handshake] Using: {}\n  Status: {}, URL: {}\n  [OK] Token received.\n  -> Saved to temp/A1_handshake.json".format(client.locked_url, status, url)
-    print(handshake_summary)
     save_json(handshake_data, "A1", "handshake")
     json_mgr.mark_done("A1")
-    resume_idx = json_mgr.get_resume_index()
 
-    # Linear flow through all sections
-    for i, (sec_key, code, desc, info, is_auto) in enumerate(FLAT_STEPS):
-        if i == 0:  # A1 already done above
-            continue
-        if i < resume_idx:
-            continue
-        if json_mgr.is_done(code) or json_mgr.is_ignored(code):
-            continue
+    # Enter Hub
+    hub_loop(client, json_mgr, is_restored)
 
-        # Show banner
-        print_section_status(i, json_mgr)
-
-        # Resume pause: don't auto-run on first step after resume
-        if i == resume_idx:
-            if is_restored:
-                print("  -> [OK] Session restored successfully")
-            ignored = prompt_continue()
-            if ignored:
-                json_mgr.mark_ignored(code)
-                print("  -> Ignored.")
-                continue
-
-            # Clean screen before executing so it looks like a fresh step
-            print_section_status(i, json_mgr)
-
-        # Execute step
-        success = False
-        step_msg = ""
-        if is_auto:
-            success, step_msg = run_auto_fetch_step(client, json_mgr, code, desc)
-        elif code in ("C4", "D3", "E4"):
-            success = run_resolve_step_auto(client, json_mgr, code)
-        elif code in ("C5", "D4", "E5"):
-            if code == "C5":
-                success = batch_fetch_section(client, json_mgr, "live")
-            elif code == "D4":
-                success = batch_fetch_section(client, json_mgr, "movies")
-            elif code == "E5":
-                success = batch_fetch_section(client, json_mgr, "series")
-        elif code == "E3":
-            success = run_episodes_step(client, json_mgr)
-        elif code == "F3":
-            success, step_msg = run_f3_step(client, json_mgr)
-        elif code == "G1":
-            fname = json_mgr.save()
-            step_msg = "  -> [OK] Consolidated JSON saved to {}".format(fname)
-            success = True
-
-        if success:
-            json_mgr.mark_done(code)
-            # Clear and redraw with updated menu before showing step output
-            print("\033[2J\033[H", end="")
-            print_section_status(i + 1, json_mgr)
-            if step_msg:
-                print(step_msg)
-            print("  -> [OK] Step complete.")
-        else:
-            json_mgr.mark_done(code)
-            print("\033[2J\033[H", end="")
-            print_section_status(i + 1, json_mgr)
-            if step_msg:
-                print(step_msg)
-            print("  -> [!] Step failed. Marking as done, continuing...")
-        
-
-        # Show [NEXT] with next step's info
-        next_idx = i + 1
-        if next_idx < len(FLAT_STEPS):
-            next_info = FLAT_STEPS[next_idx][3]
-            print("  -> [NEXT] {}".format(next_info))
-
-        # Prompt after executing
-        ignored = prompt_continue()
-
-        if ignored:
-            json_mgr.mark_ignored(code)
-            print("  -> Ignored.")
-            continue
-
-
+    # Final screen
     print_section_status(len(FLAT_STEPS), json_mgr)
     print("\nAll steps complete!")
     print("\n" + "=" * 60)
     print("   Done! All fetched data saved.")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
