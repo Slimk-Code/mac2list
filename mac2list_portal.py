@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-IPTV Portal JSON Extractor v17
-Single Enter per step. Auto-show viewer on Items.
-Viewer shows only pending categories.
-One-line counter. No section letters.
+IPTV Portal JSON Extractor v18
+State-machine filesystem: each step gets its own JSON file.
+Sessions are fully isolated under data/cache/<session_id>/.
+Consolidated resume file lives in data/session/.
 """
 import requests
 import json
@@ -16,6 +16,22 @@ import threading
 import glob
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============================================================
+# PATH CONSTANTS
+# ============================================================
+DATA_DIR    = "data"
+SESSION_DIR = "data/session"
+CACHE_DIR   = "data/cache"
+OUTPUT_DIR  = "output"
+
+
+def make_session_id(base_url, mac):
+    """Create a filesystem-safe session identifier from portal URL + MAC."""
+    clean = base_url.rstrip("/").replace("https://", "").replace("http://", "")
+    safe_portal = re.sub(r"[^a-zA-Z0-9.\-]", "_", clean)
+    safe_mac = mac.upper().replace(":", "")
+    return f"{safe_portal}_{safe_mac}"
 
 # ============================================================
 # SECTIONS & STEPS DEFINITION
@@ -67,7 +83,7 @@ SECTIONS = {
     "Convert": {
         "title": "Convert / Status",
         "items": [
-            ("G1", "generate_json", "Generate/Regenerate consolidated JSON", False),
+            ("G1", "generate_m3u", "Generate M3U playlists", False),
         ]
     },
 }
@@ -75,13 +91,8 @@ SECTIONS = {
 # ============================================================
 # HUB FLOW CONSTANTS
 # ============================================================
-SCRAPE_SECTION_KEYS = ["Auth", "Live Channels", "VOD Movies", "Series"]
+SCRAPE_SECTION_KEYS = ["Live Channels", "VOD Movies", "Series"]
 SETTINGS_SECTION_KEYS = ["Settings"]
-
-SCRAPE_STEP_CODES = []
-for sec_key in SCRAPE_SECTION_KEYS:
-    for code, _, _, _ in SECTIONS[sec_key]["items"]:
-        SCRAPE_STEP_CODES.append(code)
 
 SETTINGS_STEP_CODES = []
 for sec_key in SETTINGS_SECTION_KEYS:
@@ -105,6 +116,31 @@ FLAT_STEPS = []
 for sec_key, sec in SECTIONS.items():
     for code, desc, info, is_auto in sec["items"]:
         FLAT_STEPS.append((sec_key, code, desc, info, is_auto))
+
+# ============================================================
+# STEP → FILE MAP  (relative to cache_root)
+# ============================================================
+STEP_FILE_MAP = {
+    "A1": "01_auth/01_handshake.json",
+    "A2": "01_auth/02_profile.json",
+    "B1": "01_auth/03_account_main.json",
+    "B2": "01_auth/04_account_full.json",
+    "B3": "01_auth/05_tariff.json",
+    "C2": "02_live/01_categories.json",
+    "C5": "02_live/02_channels.json",
+    "C4": "02_live/03_resolve.json",
+    "D1": "03_vod/01_categories.json",
+    "D4": "03_vod/02_movies.json",
+    "D3": "03_vod/03_resolve.json",
+    "E1": "04_series/01_categories.json",
+    "E5": "04_series/02_items.json",
+    "E3": "04_series/03_episodes.json",
+    "E4": "04_series/04_resolve.json",
+    "F1": "05_settings/01_portal_settings.json",
+    "F2": "05_settings/02_parental_lock.json",
+    "F3": "05_settings/03_unlock.json",
+    "G1": "06_convert/01_generate.json",
+}
 
 class IPTVPortal:
     def __init__(self, base_url, mac_address):
@@ -298,23 +334,154 @@ def trim_series_item(item):
     }
 
 # ============================================================
-# JSON MANAGER
+# CACHE MANAGER  —  state-machine filesystem
 # ============================================================
-class JSONManager:
-    def __init__(self, base_url, mac):
-        safe_portal = re.sub(r"[^a-zA-Z0-9]", "_", base_url.rstrip("/").replace("http://", "").replace("https://", ""))
-        safe_mac = mac.upper().replace(":", "_")
-        self.filename = f"temp/{safe_portal}_{safe_mac}.json"
-        self.data = self._load()
-        self._ensure_tracking()
+class CacheManager:
+    """Manages per-session state-machine directory tree.
 
-    def _load(self):
-        if os.path.exists(self.filename):
+    Layout:
+        data/
+        ├── session/<session_id>.json          ← consolidated resume file
+        └── cache/<session_id>/
+            ├── 01_auth/
+            │   ├── 01_handshake.json          ← {"_status": "pending"} initially
+            │   └── ...
+            ├── 02_live/
+            ├── 03_vod/
+            ├── 04_series/
+            ├── 05_settings/
+            ├── 06_convert/
+            └── errors/
+    """
+
+    # Subdirectories to create under cache_root
+    _SUBDIRS = [
+        "01_auth",
+        "02_live",
+        "03_vod",
+        "04_series",
+        "05_settings",
+        "06_convert",
+        "errors",
+    ]
+
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.cache_root = os.path.join(CACHE_DIR, session_id)
+        self.session_file = os.path.join(SESSION_DIR, f"{session_id}.json")
+
+    # ----------------------------------------------------------
+    # Scaffold
+    # ----------------------------------------------------------
+    def scaffold(self):
+        """Create all directories and initialise missing step files to pending."""
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        os.makedirs(self.cache_root, exist_ok=True)
+        for sub in self._SUBDIRS:
+            os.makedirs(os.path.join(self.cache_root, sub), exist_ok=True)
+        # Initialise every step file if not present
+        for code, rel_path in STEP_FILE_MAP.items():
+            full = os.path.join(self.cache_root, rel_path)
+            if not os.path.exists(full):
+                with open(full, "w", encoding="utf-8") as f:
+                    json.dump({"_status": "pending"}, f, indent=2)
+
+    # ----------------------------------------------------------
+    # Step paths
+    # ----------------------------------------------------------
+    def step_path(self, code):
+        """Absolute path to the step file for *code*."""
+        rel = STEP_FILE_MAP.get(code)
+        if not rel:
+            return None
+        return os.path.join(self.cache_root, rel)
+
+    def error_path(self, code, label):
+        """Absolute path for an error file inside errors/."""
+        return os.path.join(self.cache_root, "errors", f"{code}_{label}_ERROR.json")
+
+    # ----------------------------------------------------------
+    # Read / write individual step files
+    # ----------------------------------------------------------
+    def load_step(self, code):
+        """Return the parsed JSON dict for *code*, or {} if missing."""
+        path = self.step_path(code)
+        if path and os.path.exists(path):
             try:
-                with open(self.filename, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
+        return {}
+
+    def write_step(self, code, data):
+        """Write *data* dict to the step file.  Sets _status if not already present."""
+        path = self.step_path(code)
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def write_error(self, code, label, data):
+        """Write an error dict to errors/<code>_<label>_ERROR.json."""
+        path = self.error_path(code, label)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return path
+
+    # ----------------------------------------------------------
+    # Step status helpers
+    # ----------------------------------------------------------
+    def step_status(self, code):
+        """Return _status string from the step file ('pending', 'done', 'error', 'ignored')."""
+        return self.load_step(code).get("_status", "pending")
+
+    def is_done(self, code):
+        return self.step_status(code) == "done"
+
+    def is_ignored(self, code):
+        return self.step_status(code) == "ignored"
+
+    def mark_done(self, code):
+        data = self.load_step(code)
+        data["_status"] = "done"
+        self.write_step(code, data)
+
+    def mark_ignored(self, code):
+        data = self.load_step(code)
+        data["_status"] = "ignored"
+        self.write_step(code, data)
+
+    # ----------------------------------------------------------
+    # Consolidated session file
+    # ----------------------------------------------------------
+    def save_session(self, data):
+        """Write the consolidated JSON to data/session/<session_id>.json."""
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        with open(self.session_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def load_session(self):
+        """Return the consolidated session dict, or None if not found."""
+        if os.path.exists(self.session_file):
+            try:
+                with open(self.session_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return None
+
+    # ----------------------------------------------------------
+    # Merge all step files into the consolidated structure
+    # ----------------------------------------------------------
+    def merge_all(self):
+        """Build and return the consolidated data dict from all step files."""
+        session = self.load_session()
+        if session:
+            return session
+        # Build skeleton from scratch
         return {
             "_meta": {
                 "created": datetime.now().isoformat(),
@@ -330,6 +497,22 @@ class JSONManager:
             "movies": {"total_items": 0, "grand_total": 0, "categories": []},
             "series": {"total_items": 0, "grand_total": 0, "categories": []}
         }
+
+
+# ============================================================
+# JSON MANAGER  (delegates file I/O to CacheManager)
+# ============================================================
+class JSONManager:
+    def __init__(self, base_url, mac):
+        session_id = make_session_id(base_url, mac)
+        self.cache = CacheManager(session_id)
+        self.cache.scaffold()
+        # session file path exposed for Convert step display
+        self.filename = self.cache.session_file
+        self.data = self.cache.merge_all()
+        self._ensure_tracking()
+
+    # _load() removed — CacheManager.merge_all() handles initial data load
 
     def _ensure_tracking(self):
         for section, key in [
@@ -350,8 +533,8 @@ class JSONManager:
                 self.data[section][key] = []
 
     def save(self):
-        with open(self.filename, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        """Persist consolidated data to data/session/<session_id>.json."""
+        self.cache.save_session(self.data)
         return self.filename
 
     def set_meta(self, portal, mac):
@@ -370,6 +553,8 @@ class JSONManager:
             self.data["_meta"]["done_steps"] = done
             self.update_last_step(step_code)
             self.save()
+        # Mirror status into the individual step file
+        self.cache.mark_done(step_code)
 
     def mark_ignored(self, step_code):
         ignored = self.data["_meta"].get("ignored_steps", [])
@@ -377,6 +562,8 @@ class JSONManager:
             ignored.append(step_code)
         self.data["_meta"]["ignored_steps"] = ignored
         self.update_last_step(step_code)
+        # Mirror status into the individual step file
+        self.cache.mark_ignored(step_code)
 
     def is_done(self, step_code):
         return step_code in self.data["_meta"].get("done_steps", [])
@@ -632,43 +819,66 @@ def progress_bar(current, total, prefix="", width=30):
     if current >= total:
         print()
 
-def save_json(data, code, action_name):
+def save_json(data, code, action_name, cache=None):
+    """Write raw step data. If cache is provided, writes to the step file path;
+    otherwise falls back to data/<code>_<action_name>.json."""
     if not data:
         return None
-    filename = f"temp/{code}_{action_name}.json"
+    if cache:
+        path = cache.step_path(code)
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # Merge _status:done into stored data
+            stored = dict(data)
+            stored.setdefault("_status", "done")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(stored, f, indent=2, ensure_ascii=False)
+            return path
+    # Fallback: write to data/ root
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filename = os.path.join(DATA_DIR, f"{code}_{action_name}.json")
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return filename
 
-def save_error_json(code, action_name, status, url, error_msg, lockedpath):
+def save_error_json(code, action_name, status, url, error_msg, lockedpath, cache=None):
     if lockedpath:
         reason = "Locked path returned empty/malformed data. See _lockedpath for details."
-        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_lockedpath": lockedpath}
+        error_data = {"_status": "error", "_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_lockedpath": lockedpath}
     elif status == 200:
         reason = "HTTP 200 OK from {} — portal connected but returned empty/malformed data.".format(url)
-        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
+        error_data = {"_status": "error", "_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
     elif status is not None:
         reason = "HTTP {} from {} — request failed. Portal rejected the call.".format(status, url)
-        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
+        error_data = {"_status": "error", "_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
     else:
         reason = "Connection failed — could not reach endpoint. Error: {}.".format(error_msg)
-        error_data = {"_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
-    filename = f"temp/{code}_{action_name}_ERROR.json"
+        error_data = {"_status": "error", "_error": True, "_timestamp": datetime.now().isoformat(), "_action": action_name, "_reason": reason, "_url": url}
+    if cache:
+        # Write the error into errors/ dir AND mark the step file as error
+        err_path = cache.write_error(code, action_name, error_data)
+        step_path = cache.step_path(code)
+        if step_path:
+            with open(step_path, "w", encoding="utf-8") as f:
+                json.dump({"_status": "error", "_error_file": os.path.basename(err_path)}, f, indent=2)
+        return err_path
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filename = os.path.join(DATA_DIR, f"{code}_{action_name}_ERROR.json")
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(error_data, f, indent=2, ensure_ascii=False)
     return filename
 
-def handle_fetch_result(result, code, safe_name):
+def handle_fetch_result(result, code, safe_name, cache=None):
     data = result.get("_data")
     status = result.get("_status")
     url = result.get("_url")
     error_msg = result.get("_error")
     lockedpath = result.get("_lockedpath")
     if data:
-        fname = save_json(data, code, safe_name)
+        fname = save_json(data, code, safe_name, cache=cache)
         return fname, "ok", False, False
     else:
-        fname = save_error_json(code, safe_name, status, url, error_msg, lockedpath)
+        fname = save_error_json(code, safe_name, status, url, error_msg, lockedpath, cache=cache)
         is_200 = (status == 200) or (lockedpath and lockedpath[0].get("status") == 200)
         return fname, "error", True, is_200
 
@@ -818,7 +1028,7 @@ def view_categories(json_mgr, section, client=None):
                 break
             # else: ignore when nothing pending
         elif choice == "D":
-            return "done"
+            return "done" if total_pending == 0 else None
         elif choice == "":
             if page < max_page:
                 page += 1
@@ -872,19 +1082,17 @@ def _fetch_single_category(client, json_mgr, section, cat_id, action_type, actio
     data = result.get("_data")
     failed_pages = []
     if data and isinstance(data, dict):
-        # Save full response to temp file
-        if section == "live":
-            temp_name = "live.json"
-        elif section == "movies":
-            temp_name = "vod.json"
-        elif section == "series":
-            temp_name = "series.json"
-        else:
-            temp_name = f"{section}.json"
-        
-        with open(f"temp/{temp_name}", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
+        # Save raw page data into the section's step file via CacheManager
+        cache = getattr(json_mgr, "cache", None)
+        if cache:
+            step_code = {"live": "C5", "movies": "D4", "series": "E5"}.get(section)
+            if step_code:
+                step_path = cache.step_path(step_code)
+                if step_path:
+                    os.makedirs(os.path.dirname(step_path), exist_ok=True)
+                    with open(step_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+
         js = data.get("js", {})
         if isinstance(js, dict):
             items = js.get("data", [])
@@ -913,6 +1121,19 @@ def _fetch_single_category(client, json_mgr, section, cat_id, action_type, actio
 # ============================================================
 def run_episodes_step(client, json_mgr):
     """Fetch episodes for selected series. Loops until user presses Done."""
+    cache = getattr(json_mgr, "cache", None)
+    existing_responses = []
+    if cache:
+        step_path = cache.step_path("E3")
+        if step_path and os.path.exists(step_path):
+            try:
+                with open(step_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    existing_responses = existing.get("responses", [])
+            except Exception:
+                pass
+
     while True:
         # Collect all series items
         series_items = []
@@ -977,7 +1198,7 @@ def run_episodes_step(client, json_mgr):
                 else:
                     continue
             elif choice == "D":
-                return "done"
+                return "done" if total_pending == 0 else None
             elif choice == "":
                 if page < max_page:
                     page += 1
@@ -1031,6 +1252,11 @@ def run_episodes_step(client, json_mgr):
                             "cmd": season_item.get("cmd", "")
                         })
                     json_mgr.update_series_episodes(sid, seasons)
+                    existing_responses.append({
+                        "id": sid,
+                        "name": name,
+                        "raw_response": data
+                    })
                 else:
                     fail_count += 1
                 # Progress bar
@@ -1049,6 +1275,18 @@ def run_episodes_step(client, json_mgr):
                 print("  -> [OK] Fetched {}/{} series. {} failed.".format(len(to_fetch) - fail_count, len(to_fetch), fail_count))
             else:
                 print("  -> [OK] Fetched {}/{} series.".format(len(to_fetch), len(to_fetch)))
+            if cache:
+                step_path = cache.step_path("E3")
+                if step_path:
+                    step_data = {
+                        "_status": "done",
+                        "_total_fetched": len(existing_responses),
+                        "_total_failed": fail_count,
+                        "responses": existing_responses
+                    }
+                    os.makedirs(os.path.dirname(step_path), exist_ok=True)
+                    with open(step_path, "w", encoding="utf-8") as f:
+                        json.dump(step_data, f, indent=2, ensure_ascii=False)
             time.sleep(0.5)
             to_fetch = []  # clear for next loop
 
@@ -1093,6 +1331,8 @@ def batch_fetch_section(client, json_mgr, section):
         to_fetch = view_categories(json_mgr, section, client)
         if to_fetch == "done":
             return "done"
+        if to_fetch is None:
+            return False
         if not to_fetch:
             return True
 
@@ -1221,7 +1461,8 @@ def run_auto_fetch_step(client, json_mgr, step_code, step_desc):
         return False, ""
     result = client.fetch(params)
     safe_name = step_desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
-    fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name)
+    cache = getattr(json_mgr, "cache", None)
+    fname, status_str, is_error, is_200 = handle_fetch_result(result, step_code, safe_name, cache=cache)
     if is_error:
         return False, "  -> [!] Failed — saved error to {}".format(fname)
     msg = "  -> [OK] Saved to {}".format(fname)
@@ -1268,6 +1509,18 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
     page_size = 20
     page = 0
     to_resolve = []
+    cache = getattr(json_mgr, "cache", None)
+    existing_responses = []
+    if cache:
+        step_path = cache.step_path(step_code)
+        if step_path and os.path.exists(step_path):
+            try:
+                with open(step_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    existing_responses = existing.get("responses", [])
+            except Exception:
+                pass
 
     while True:
         # Recalculate pending/resolved each time we redraw
@@ -1316,7 +1569,7 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
             if total_pending > 0:
                 to_resolve = pending[:]
         elif choice == "D":
-            return "done"
+            return "done" if total_pending == 0 else None
         elif choice == "":
             if page < max_page:
                 page += 1
@@ -1357,21 +1610,37 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
                       "forced_storage": "undefined", "disable_ad": "0", "download": "0", "JsHttpRequest": "1-xml"}
             result = client.fetch(params)
             data = result.get("_data")
-            if data and isinstance(data, dict):
-                js_val = data.get("js")
-                if isinstance(js_val, str):
-                    resolved_url = js_val
-                elif isinstance(js_val, dict):
-                    resolved_url = js_val.get("cmd")
-                else:
-                    resolved_url = None
-                if resolved_url:
-                    item["resolved_url"] = resolved_url
-                    json_mgr.save()
+            if action_type == "itv":
+                resolved_url = cmd[7:] if cmd.startswith("ffmpeg ") else cmd
+                item["resolved_url"] = resolved_url
+                json_mgr.save()
+                existing_responses.append({
+                    "id": item.get("id", ""),
+                    "name": item.get("name", item.get("title", "")),
+                    "raw_response": data if data else cmd
+                })
+            else:
+                if data and isinstance(data, dict):
+                    js_val = data.get("js")
+                    if isinstance(js_val, str):
+                        resolved_url = js_val
+                    elif isinstance(js_val, dict):
+                        resolved_url = js_val.get("cmd")
+                    else:
+                        resolved_url = None
+                    if resolved_url:
+                        resolved_url = resolved_url[7:] if resolved_url.startswith("ffmpeg ") else resolved_url
+                        item["resolved_url"] = resolved_url
+                        json_mgr.save()
+                        existing_responses.append({
+                            "id": item.get("id", ""),
+                            "name": item.get("name", item.get("title", "")),
+                            "raw_response": data
+                        })
+                    else:
+                        fail_count += 1
                 else:
                     fail_count += 1
-            else:
-                fail_count += 1
             # Inline progress bar with failed count
             pct = ((i + 1) / len(to_resolve)) * 100
             filled = int(30 * (i + 1) / len(to_resolve))
@@ -1388,11 +1657,36 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
             print("  -> [OK] Resolved {}/{} items. {} failed.".format(len(to_resolve) - fail_count, len(to_resolve), fail_count))
         else:
             print("  -> [OK] Resolved {}/{} items.".format(len(to_resolve), len(to_resolve)))
+        if cache:
+            step_path = cache.step_path(step_code)
+            if step_path:
+                step_data = {
+                    "_status": "done",
+                    "_total_resolved": len(existing_responses),
+                    "_total_failed": fail_count,
+                    "responses": existing_responses
+                }
+                os.makedirs(os.path.dirname(step_path), exist_ok=True)
+                with open(step_path, "w", encoding="utf-8") as f:
+                    json.dump(step_data, f, indent=2, ensure_ascii=False)
         time.sleep(0.5)
 
 
 def _resolve_episodes(client, json_mgr, step_code):
     """E4: Series -> Episodes -> Resolve. Loops until user presses Done."""
+    cache = getattr(json_mgr, "cache", None)
+    existing_responses = []
+    if cache:
+        step_path = cache.step_path(step_code)
+        if step_path and os.path.exists(step_path):
+            try:
+                with open(step_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    existing_responses = existing.get("responses", [])
+            except Exception:
+                pass
+
     while True:
         # Collect series that have episodes fetched (from Step E3)
         series_items = []
@@ -1468,7 +1762,7 @@ def _resolve_episodes(client, json_mgr, step_code):
                     selected_series = "ALL"
                     break
             elif choice == "D":
-                return "done"
+                return "done" if total_pending == 0 else None
             elif choice == "":
                 page = (page + 1) if page < max_page else 0
                 continue
@@ -1533,11 +1827,18 @@ def _resolve_episodes(client, json_mgr, step_code):
                     else:
                         resolved_url = ""
                     if resolved_url:
+                        resolved_url = resolved_url[7:] if resolved_url.startswith("ffmpeg ") else resolved_url
                         for season in s_series.get("seasons", []):
                             if season.get("name") == s_name:
                                 season["resolved_ep_{}".format(ep_num)] = resolved_url
                                 break
                         json_mgr.save()
+                        existing_responses.append({
+                            "series_name": ep_dict.get("series_name", ""),
+                            "season_name": s_name,
+                            "episode_num": ep_num,
+                            "raw_response": data
+                        })
                     else:
                         fail_count += 1
                 else:
@@ -1556,6 +1857,18 @@ def _resolve_episodes(client, json_mgr, step_code):
                 print("  -> [OK] Resolved {}/{} episodes. {} failed.".format(len(all_episodes) - fail_count, len(all_episodes), fail_count))
             else:
                 print("  -> [OK] Resolved {}/{} episodes.".format(len(all_episodes), len(all_episodes)))
+            if cache:
+                step_path = cache.step_path(step_code)
+                if step_path:
+                    step_data = {
+                        "_status": "done",
+                        "_total_resolved": len(existing_responses),
+                        "_total_failed": fail_count,
+                        "responses": existing_responses
+                    }
+                    os.makedirs(os.path.dirname(step_path), exist_ok=True)
+                    with open(step_path, "w", encoding="utf-8") as f:
+                        json.dump(step_data, f, indent=2, ensure_ascii=False)
             time.sleep(0.5)
             selected_series = None
             continue
@@ -1607,15 +1920,20 @@ def _resolve_episodes(client, json_mgr, step_code):
                 else:
                     resolved_url = ""
                 if resolved_url:
+                    resolved_url = resolved_url[7:] if resolved_url.startswith("ffmpeg ") else resolved_url
                     for season in selected_series.get("seasons", []):
                         if season.get("name") == s_name:
                             season["resolved_ep_{}".format(ep_num)] = resolved_url
                             break
                     json_mgr.save()
+                    existing_responses.append({
+                        "series_name": selected_series.get("name", ""),
+                        "season_name": s_name,
+                        "episode_num": ep_num,
+                        "raw_response": data
+                    })
                 else:
                     fail_count += 1
-            else:
-                fail_count += 1
             # Progress bar
             pct = ((i + 1) / len(episodes)) * 100
             filled = int(30 * (i + 1) / len(episodes))
@@ -1632,6 +1950,18 @@ def _resolve_episodes(client, json_mgr, step_code):
             print("  -> [OK] Resolved {}/{} episodes. {} failed.".format(len(episodes) - fail_count, len(episodes), fail_count))
         else:
             print("  -> [OK] Resolved {}/{} episodes.".format(len(episodes), len(episodes)))
+        if cache:
+            step_path = cache.step_path(step_code)
+            if step_path:
+                step_data = {
+                    "_status": "done",
+                    "_total_resolved": len(existing_responses),
+                    "_total_failed": fail_count,
+                    "responses": existing_responses
+                }
+                os.makedirs(os.path.dirname(step_path), exist_ok=True)
+                with open(step_path, "w", encoding="utf-8") as f:
+                    json.dump(step_data, f, indent=2, ensure_ascii=False)
         time.sleep(0.5)
         selected_series = None  # clear for next loop
 
@@ -1655,6 +1985,7 @@ def run_resolve_step_auto(client, json_mgr, step_code):
         return False
 
 def run_f3_step(client, json_mgr):
+    cache = getattr(json_mgr, "cache", None)
     pins = ["0000", "1234", "3333"]
     unlocked = False
     msg = ""
@@ -1671,12 +2002,13 @@ def run_f3_step(client, json_mgr):
                 break
     if unlocked:
         safe_name = "type_itv_action_set_parental_lock_UNLOCKED"
-        fname = save_json(data, "F3", safe_name)
+        fname = save_json(data, "F3", safe_name, cache=cache)
         msg += "\n  -> Saved to {}".format(fname)
         return True, msg
     else:
         msg += "\n  -> [-] All PINs failed (0000, 1234, 3333)"
         error_data = {
+            "_status": "error",
             "_error": True,
             "_timestamp": datetime.now().isoformat(),
             "_action": "type=itv&action=set_parental_lock",
@@ -1684,10 +2016,13 @@ def run_f3_step(client, json_mgr):
             "_tried_pins": pins,
             "_lockedpath": result.get("_lockedpath", [])
         }
-        safe_name = "type_itv_action_set_parental_lock_ERROR"
-        filename = "temp/F3_{}.json".format(safe_name)
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(error_data, f, indent=2, ensure_ascii=False)
+        if cache:
+            filename = cache.write_error("F3", "type_itv_action_set_parental_lock", error_data)
+        else:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            filename = os.path.join(DATA_DIR, "F3_type_itv_action_set_parental_lock_ERROR.json")
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(error_data, f, indent=2, ensure_ascii=False)
         msg += "\n  -> Saved error to {}".format(filename)
         return True, msg
 
@@ -1695,13 +2030,11 @@ def run_f3_step(client, json_mgr):
 # RESUME / STARTUP
 # ============================================================
 def scan_existing_sessions():
-    os.makedirs("temp", exist_ok=True)
-    files = glob.glob("temp/*_*.json")
+    """Scan data/session/ for existing consolidated session files."""
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    files = glob.glob(os.path.join(SESSION_DIR, "*.json"))
     sessions = []
     for f in files:
-        basename = os.path.basename(f)
-        if re.match(r"^[A-Z]\d+_", basename):
-            continue
         try:
             with open(f, "r", encoding="utf-8") as file:
                 data = json.load(file)
@@ -1730,7 +2063,7 @@ STEP_NAME_MAP = {
     "D1": "VOD Categories", "D4": "VOD Movies", "D3": "VOD Resolve",
     "E1": "Series Categories", "E5": "Series Items", "E3": "Episodes", "E4": "Series Resolve",
     "F1": "Portal Settings", "F2": "Parental Lock", "F3": "Unlock Adult",
-    "G1": "Generate JSON",
+    "G1": "Generate M3U",
 }
 
 
@@ -1745,7 +2078,7 @@ def show_resume_menu(sessions, reveal_new=False, portal="", mac=""):
     """Display landing page. If reveal_new=True, show Portal/MAC inputs inline."""
     clear_screen()
     print("=" * 60)
-    print("   IPTV Portal JSON Extractor v17")
+    print("   IPTV Portal JSON Extractor v18")
     print("=" * 60)
     print()
 
@@ -1841,23 +2174,22 @@ def run_resume_or_new():
                 print("  [!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
                 input("  Press Enter to retry...")
                 continue
-            os.makedirs("temp", exist_ok=True)
+            os.makedirs(DATA_DIR, exist_ok=True)
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            os.makedirs(CACHE_DIR, exist_ok=True)
             json_mgr = JSONManager(portal, mac)
             json_mgr.set_meta(portal, mac)
             break
 
         else:
-            # Restore session
+            # Restore session — JSONManager loads from data/session/ automatically
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(sessions):
                     session = sessions[idx]
-                    with open(session["file"], "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    portal = data["_meta"].get("portal", "")
-                    mac = data["_meta"].get("mac", "")
+                    portal = session["portal"]
+                    mac = session["mac"]
                     json_mgr = JSONManager(portal, mac)
-                    json_mgr.data = data
                     is_restored = True
                     break
             except:
@@ -1869,6 +2201,53 @@ def run_resume_or_new():
 # ============================================================
 # PAGE 2 — MAIN HUB
 # ============================================================
+def show_hub_header(json_mgr):
+    """Print hub header/menu without input prompt."""
+    clear_screen()
+    print("=" * 60)
+    print("   IPTV Portal JSON Extractor v17 — Main Hub")
+    print("=" * 60)
+    print()
+
+    cat_codes = ["C2", "D1", "E1"]
+    cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
+    cat_status = "[all done]" if cat_done == len(cat_codes) else "[{}/{} done]".format(cat_done, len(cat_codes))
+
+    def section_status(sec_key):
+        sec = SECTIONS[sec_key]
+        done = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
+        total = len(sec["items"])
+        return "{}/{} done".format(done, total)
+
+    live_count = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
+    movie_count = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
+    series_count = sum(1 for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", []) if any(se.get("resolved_ep_{}".format(ep)) for se in s.get("seasons", []) for ep in se.get("episodes", [])))
+
+    convert_status = "Done" if json_mgr.is_done("G1") else "Ready"
+
+    settings_done = sum(1 for code in SETTINGS_STEP_CODES if json_mgr.is_done(code))
+    settings_total = len(SETTINGS_STEP_CODES)
+
+    auth_section = SECTIONS["Auth"]
+    auth_done = sum(1 for code, _, _, _ in auth_section["items"] if json_mgr.is_done(code))
+    auth_total = len(auth_section["items"])
+
+    print("  [1] Scrape Categories  —  {}".format(cat_status))
+    print()
+    print("  [2] Live Channels      —  {}".format(section_status("Live Channels")))
+    print("  [3] VOD Movies         —  {}".format(section_status("VOD Movies")))
+    print("  [4] Series             —  {}".format(section_status("Series")))
+    print()
+    print("  [5] Watch              —  {} ch, {} movies, {} series".format(live_count, movie_count, series_count))
+    print("  [6] Convert            —  {}".format(convert_status))
+    print()
+    print("  [7] Settings           —  {}/{} done".format(settings_done, settings_total))
+    print("  [8] Auth               —  {}/{} done".format(auth_done, auth_total))
+    print()
+    print("  [Q] Quit")
+    print()
+
+
 def show_hub(json_mgr):
     """Display Main Hub. Returns user choice string."""
     clear_screen()
@@ -1877,18 +2256,22 @@ def show_hub(json_mgr):
     print("=" * 60)
     print()
 
-    # Scrape progress
-    scrape_done = 0
-    for sec_key in SCRAPE_SECTION_KEYS:
+    # Scrape categories status
+    cat_codes = ["C2", "D1", "E1"]
+    cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
+    cat_status = "[all done]" if cat_done == len(cat_codes) else "[{}/{} done]".format(cat_done, len(cat_codes))
+
+    # Per-section status
+    def section_status(sec_key):
         sec = SECTIONS[sec_key]
-        if all(json_mgr.is_done(code) or json_mgr.is_ignored(code) for code, _, _, _ in sec["items"]):
-            scrape_done += 1
-    scrape_total = len(SCRAPE_SECTION_KEYS)
+        done = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
+        total = len(sec["items"])
+        return "{}/{} done".format(done, total)
 
     # Watch counts
-    live_count = sum(len(c.get("channels", [])) for c in json_mgr.data["live"].get("categories", []))
-    movie_count = sum(len(c.get("items", [])) for c in json_mgr.data["movies"].get("categories", []))
-    series_count = sum(len(c.get("items", [])) for c in json_mgr.data["series"].get("categories", []))
+    live_count = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
+    movie_count = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
+    series_count = sum(1 for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", []) if any(se.get("resolved_ep_{}".format(ep)) for se in s.get("seasons", []) for ep in se.get("episodes", [])))
 
     # Convert
     convert_status = "Done" if json_mgr.is_done("G1") else "Ready"
@@ -1897,10 +2280,22 @@ def show_hub(json_mgr):
     settings_done = sum(1 for code in SETTINGS_STEP_CODES if json_mgr.is_done(code))
     settings_total = len(SETTINGS_STEP_CODES)
 
-    print("  [1] Scrape        —  {}/{} sections complete".format(scrape_done, scrape_total))
-    print("  [2] Watch         —  {} ch, {} movies, {} series".format(live_count, movie_count, series_count))
-    print("  [3] Convert       —  {}".format(convert_status))
-    print("  [4] Settings      —  {}/{} done".format(settings_done, settings_total))
+    # Auth
+    auth_section = SECTIONS["Auth"]
+    auth_done = sum(1 for code, _, _, _ in auth_section["items"] if json_mgr.is_done(code))
+    auth_total = len(auth_section["items"])
+
+    print("  [1] Scrape Categories  —  {}".format(cat_status))
+    print()
+    print("  [2] Live Channels      —  {}".format(section_status("Live Channels")))
+    print("  [3] VOD Movies         —  {}".format(section_status("VOD Movies")))
+    print("  [4] Series             —  {}".format(section_status("Series")))
+    print()
+    print("  [5] Watch              —  {} ch, {} movies, {} series".format(live_count, movie_count, series_count))
+    print("  [6] Convert            —  {}".format(convert_status))
+    print()
+    print("  [7] Settings           —  {}/{} done".format(settings_done, settings_total))
+    print("  [8] Auth               —  {}/{} done".format(auth_done, auth_total))
     print()
     print("  [Q] Quit")
     print()
@@ -1923,111 +2318,110 @@ def hub_loop(client, json_mgr, is_restored):
             print("  Quitting...")
             sys.exit(0)
         elif choice == "1":
-            run_scrape_submenu(client, json_mgr)
-        elif choice == "2":
-            run_watch_submenu(json_mgr)
-        elif choice == "3":
-            run_convert_submenu(json_mgr)
-        elif choice == "4":
-            run_settings_submenu(client, json_mgr)
-        else:
-            print("  Invalid choice.")
-            time.sleep(0.5)
-
-
-# ============================================================
-# PAGE 3 — SCRAPE SUB-MENU
-# ============================================================
-def print_scrape_submenu(json_mgr):
-    """Display Scrape sub-menu with section picker."""
-    clear_screen()
-    print("=" * 60)
-
-    done_sections = 0
-    for sec_key in SCRAPE_SECTION_KEYS:
-        sec = SECTIONS[sec_key]
-        if all(json_mgr.is_done(code) or json_mgr.is_ignored(code) for code, _, _, _ in sec["items"]):
-            done_sections += 1
-
-    print("   Scrape — {}/{} sections complete".format(done_sections, len(SCRAPE_SECTION_KEYS)))
-    print("=" * 60)
-    print()
-
-    for sec_num, sec_key in enumerate(SCRAPE_SECTION_KEYS, 1):
-        sec = SECTIONS[sec_key]
-        done_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
-        ignored_count = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_ignored(code))
-        total_count = len(sec["items"])
-
-        if done_count + ignored_count == total_count:
-            status = "[all done]"
-        else:
-            status = "[{}/{} done]".format(done_count, total_count)
-
-        print("  [{}] {} {}".format(sec_num, sec["title"], status))
-
-    print()
-    print("  [Enter] Continue next pending  |  [1-{}] Pick section  |  [B] Back to Hub".format(len(SCRAPE_SECTION_KEYS)))
-
-
-def run_scrape_submenu(client, json_mgr):
-    """Scrape sub-menu loop with section picker."""
-    while True:
-        print_scrape_submenu(json_mgr)
-        choice = input("  > ").strip().upper()
-        if choice == "B":
-            break
-        elif choice == "":
-            next_code = get_next_pending_step(json_mgr, SCRAPE_STEP_CODES)
-            if next_code is None:
-                print("  -> [OK] All scrape steps complete.")
-                input("  Press Enter to continue...")
-            else:
-                idx, sec_key, desc, info, is_auto = get_step_info(next_code)
+            cat_codes = ["C2", "D1", "E1"]
+            while True:
+                next_code = get_next_pending_step(json_mgr, cat_codes)
+                if next_code is None:
+                    break
+                show_hub_header(json_mgr)
+                idx, _, desc, info, is_auto = get_step_info(next_code)
                 run_single_step(client, json_mgr, next_code, desc, info, is_auto)
-        elif choice.isdigit() and 1 <= int(choice) <= len(SCRAPE_SECTION_KEYS):
-            sec_key = SCRAPE_SECTION_KEYS[int(choice) - 1]
-            run_section_submenu(client, json_mgr, sec_key)
+        elif choice == "2":
+            run_section_submenu(client, json_mgr, "Live Channels", skip=["C2"])
+        elif choice == "3":
+            run_section_submenu(client, json_mgr, "VOD Movies", skip=["D1"])
+        elif choice == "4":
+            run_section_submenu(client, json_mgr, "Series", skip=["E1"])
+        elif choice == "5":
+            run_watch_submenu(json_mgr)
+        elif choice == "6":
+            run_convert_submenu(json_mgr)
+        elif choice == "7":
+            run_settings_submenu(client, json_mgr)
+        elif choice == "8":
+            run_section_submenu(client, json_mgr, "Auth")
         else:
             print("  Invalid choice.")
             time.sleep(0.5)
 
-def run_section_submenu(client, json_mgr, sec_key):
-    """Mini linear flow for one section (e.g., VOD Movies)."""
+
+def _step_progress(json_mgr, code):
+    """Return progress string for a step code."""
+    if code == "C5":
+        cats = json_mgr.data["live"].get("categories", [])
+        total = len([c for c in cats if str(c.get("id")) != "*"])
+        fetched = len(json_mgr.get_live_fetched())
+        return "{}/{} fetched".format(fetched, total)
+    elif code == "C4":
+        total = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []))
+        resolved = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
+        return "{}/{} resolved".format(resolved, total)
+    elif code == "D4":
+        cats = json_mgr.data["movies"].get("categories", [])
+        total = len([c for c in cats if str(c.get("id")) != "*"])
+        fetched = len(json_mgr.get_movie_fetched())
+        return "{}/{} fetched".format(fetched, total)
+    elif code == "D3":
+        total = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []))
+        resolved = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
+        return "{}/{} resolved".format(resolved, total)
+    elif code == "E5":
+        cats = json_mgr.data["series"].get("categories", [])
+        total = len([c for c in cats if str(c.get("id")) != "*"])
+        fetched = len(json_mgr.get_series_fetched())
+        return "{}/{} fetched".format(fetched, total)
+    elif code == "E3":
+        all_series = [s for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", [])]
+        total = len(all_series)
+        fetched = sum(1 for s in all_series if s.get("seasons"))
+        return "{}/{} fetched".format(fetched, total)
+    elif code == "E4":
+        total_eps = 0
+        resolved_eps = 0
+        for c in json_mgr.data["series"].get("categories", []):
+            for s in c.get("items", []):
+                for se in s.get("seasons", []):
+                    for ep in se.get("episodes", []):
+                        total_eps += 1
+                        if se.get("resolved_ep_{}".format(ep)):
+                            resolved_eps += 1
+        return "{}/{} resolved".format(resolved_eps, total_eps)
+    elif json_mgr.is_done(code):
+        return "done"
+    return "pending"
+
+
+def run_section_submenu(client, json_mgr, sec_key, skip=None):
+    """Independent step picker for one section."""
+    if skip is None:
+        skip = []
     sec = SECTIONS[sec_key]
-    section_codes = [code for code, _, _, _ in sec["items"]]
+    visible_items = [(c, d, i, a) for c, d, i, a in sec["items"] if c not in skip]
 
     while True:
         clear_screen()
         print("=" * 60)
-        done_count = sum(1 for code in section_codes if json_mgr.is_done(code))
-        print("   {} — {}/{} done".format(sec["title"], done_count, len(section_codes)))
+        print("   {}".format(sec["title"]))
         print("=" * 60)
         print()
 
-        for j, (code, desc, info, _) in enumerate(sec["items"]):
-            if json_mgr.is_done(code):
-                mark = "[x]"
-            elif json_mgr.is_ignored(code):
-                mark = "[I]"
-            else:
-                mark = "[>]"
-            print("  {} {:<50} {}".format(mark, desc, info))
+        for j, (code, desc, info, _) in enumerate(visible_items):
+            progress = _step_progress(json_mgr, code)
+            print("  [{}] {:<45} {}".format(j + 1, desc, progress))
 
         print()
-        print("  [Enter] Continue next pending  |  [B] Back to Scrape")
+        if len(visible_items) > 1:
+            print("  [1-{}] Pick step  |  [B] Back to Hub".format(len(visible_items)))
+        else:
+            print("  [1] Pick step  |  [B] Back to Hub")
 
         choice = input("  > ").strip().upper()
         if choice == "B":
             break
-        elif choice == "":
-            next_code = get_next_pending_step(json_mgr, section_codes)
-            if next_code is None:
-                print("  -> [OK] All steps in {} complete.".format(sec["title"]))
-                input("  Press Enter to continue...")
-            else:
-                idx, _, desc, info, is_auto = get_step_info(next_code)
-                run_single_step(client, json_mgr, next_code, desc, info, is_auto)
+        elif choice.isdigit() and 1 <= int(choice) <= len(visible_items):
+            code = visible_items[int(choice) - 1][0]
+            idx, _, desc, info, is_auto = get_step_info(code)
+            run_single_step(client, json_mgr, code, desc, info, is_auto)
         else:
             print("  Invalid choice.")
             time.sleep(0.5)
@@ -2081,6 +2475,75 @@ def run_settings_submenu(client, json_mgr):
 
 
 # ============================================================
+# M3U GENERATOR
+# ============================================================
+def generate_m3u(json_mgr):
+    session_id = json_mgr.cache.session_id
+    out_dir = os.path.join(OUTPUT_DIR, session_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    files = {}
+
+    # LIVE
+    lines = ["#EXTM3U"]
+    for cat in json_mgr.data["live"].get("categories", []):
+        group = cat.get("title", "General")
+        for ch in cat.get("channels", []):
+            url = ch.get("resolved_url", "")
+            if not url:
+                continue
+            name = ch.get("name", "Unknown")
+            logo = ch.get("logo", "")
+            lines.append('#EXTINF:-1 tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}'.format(
+                ch.get("id", ""), name, logo, group, name))
+            lines.append(url)
+    live_path = os.path.join(out_dir, "{}_LIVE.m3u".format(session_id))
+    with open(live_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    files["live"] = live_path
+
+    # MOVIES
+    lines = ["#EXTM3U"]
+    for cat in json_mgr.data["movies"].get("categories", []):
+        group = cat.get("title", "Movies")
+        for m in cat.get("items", []):
+            url = m.get("resolved_url", "")
+            if not url:
+                continue
+            name = m.get("name", "Unknown")
+            logo = m.get("logo", "")
+            lines.append('#EXTINF:-1 tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}'.format(
+                m.get("id", ""), name, logo, group, name))
+            lines.append(url)
+    movie_path = os.path.join(out_dir, "{}_MOVIE.m3u".format(session_id))
+    with open(movie_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    files["movies"] = movie_path
+
+    # SERIES
+    lines = ["#EXTM3U"]
+    for cat in json_mgr.data["series"].get("categories", []):
+        for item in cat.get("items", []):
+            series_name = item.get("name", "Unknown")
+            for season in item.get("seasons", []):
+                season_name = season.get("name", "Unknown")
+                for ep in season.get("episodes", []):
+                    url = season.get("resolved_ep_{}".format(ep), "")
+                    if not url:
+                        continue
+                    title = "{} - {} E{:02d}".format(series_name, season_name, ep)
+                    lines.append('#EXTINF:-1 tvg-name="{}" group-title="Series",{}'.format(
+                        series_name, title))
+                    lines.append(url)
+    series_path = os.path.join(out_dir, "{}_SERIE.m3u".format(session_id))
+    with open(series_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    files["series"] = series_path
+
+    return files
+
+
+# ============================================================
 # PAGE 3 — CONVERT
 # ============================================================
 def run_convert_submenu(json_mgr):
@@ -2091,21 +2554,23 @@ def run_convert_submenu(json_mgr):
     print("=" * 60)
     print()
 
-    if json_mgr.is_done("G1"):
-        print("  -> Consolidated JSON already generated.")
-        print("  -> File: {}".format(json_mgr.filename))
-        print()
-        print("  [R] Regenerate  |  [B] Back to Hub")
-        choice = input("  > ").strip().upper()
-        if choice == "R":
-            fname = json_mgr.save()
-            print("  -> [OK] Regenerated: {}".format(fname))
-            input("  Press Enter to continue...")
-    else:
-        fname = json_mgr.save()
-        print("  -> [OK] Consolidated JSON saved to {}".format(fname))
-        json_mgr.mark_done("G1")
-        input("  Press Enter to continue...")
+    files = generate_m3u(json_mgr)
+    json_mgr.mark_done("G1")
+
+    print("  -> [OK] M3U files generated:")
+    print("     Live:   {}".format(files.get("live", "")))
+    print("     Movies: {}".format(files.get("movies", "")))
+    print("     Series: {}".format(files.get("series", "")))
+    print()
+    print("  [R] Regenerate  |  [B] Back to Hub")
+    choice = input("  > ").strip().upper()
+    if choice == "R":
+        files = generate_m3u(json_mgr)
+        print("  -> [OK] Regenerated:")
+        print("     Live:   {}".format(files.get("live", "")))
+        print("     Movies: {}".format(files.get("movies", "")))
+        print("     Series: {}".format(files.get("series", "")))
+    input("  Press Enter to continue...")
 
 
 # ============================================================
@@ -2119,9 +2584,9 @@ def show_watch_submenu(json_mgr):
     print("=" * 60)
     print()
 
-    live_count = sum(len(c.get("channels", [])) for c in json_mgr.data["live"].get("categories", []))
-    movie_count = sum(len(c.get("items", [])) for c in json_mgr.data["movies"].get("categories", []))
-    series_count = sum(len(c.get("items", [])) for c in json_mgr.data["series"].get("categories", []))
+    live_count = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
+    movie_count = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
+    series_count = sum(1 for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", []) if any(se.get("resolved_ep_{}".format(ep)) for se in s.get("seasons", []) for ep in se.get("episodes", [])))
 
     print("  [1] Live Channels     —  {} channels".format(live_count))
     print("  [2] VOD Movies        —  {} movies".format(movie_count))
@@ -2176,8 +2641,8 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
     elif code == "F3":
         success, step_msg = run_f3_step(client, json_mgr)
     elif code == "G1":
-        fname = json_mgr.save()
-        step_msg = "  -> [OK] Consolidated JSON saved to {}".format(fname)
+        files = generate_m3u(json_mgr)
+        step_msg = "  -> [OK] M3U files saved to {}".format(os.path.join(OUTPUT_DIR, json_mgr.cache.session_id))
         success = True
 
     if success:
@@ -2186,10 +2651,9 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
             print(step_msg)
         print("  -> [OK] {} complete.".format(desc))
     else:
-        json_mgr.mark_done(code)
         if step_msg:
             print(step_msg)
-        print("  -> [!] {} failed. Marking as done.".format(desc))
+        print("  -> [..] {} — not complete yet.".format(desc))
 
     print()
     input("  Press Enter to continue...")
@@ -2247,7 +2711,8 @@ def watch_live(json_mgr):
     items = []
     for cat in json_mgr.data["live"].get("categories", []):
         for ch in cat.get("channels", []):
-            items.append(ch)
+            if ch.get("resolved_url"):
+                items.append(ch)
 
     if not items:
         print("  No channels available. Fetch channels first (Scrape → Live).")
@@ -2269,7 +2734,8 @@ def watch_movies(json_mgr):
     items = []
     for cat in json_mgr.data["movies"].get("categories", []):
         for m in cat.get("items", []):
-            items.append(m)
+            if m.get("resolved_url"):
+                items.append(m)
 
     if not items:
         print("  No movies available. Fetch movies first (Scrape → VOD).")
@@ -2291,7 +2757,14 @@ def watch_series(json_mgr):
     items = []
     for cat in json_mgr.data["series"].get("categories", []):
         for s in cat.get("items", []):
-            items.append(s)
+            seasons = s.get("seasons", [])
+            has_resolved = any(
+                se.get("resolved_ep_{}".format(ep))
+                for se in seasons
+                for ep in se.get("episodes", [])
+            )
+            if has_resolved:
+                items.append(s)
 
     if not items:
         print("  No series available. Fetch series first (Scrape → Series).")
@@ -2333,11 +2806,13 @@ def main():
     lockedpath = handshake_result.get("_lockedpath")
     if not client.token:
         print("[!] Handshake failed — no token received.")
-        fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath)
+        cache = getattr(json_mgr, "cache", None)
+        fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath, cache=cache)
         print("  -> Saved error to {}".format(fname))
         return
 
-    save_json(handshake_data, "A1", "handshake")
+    cache = getattr(json_mgr, "cache", None)
+    save_json(handshake_data, "A1", "handshake", cache=cache)
     json_mgr.mark_done("A1")
 
     # Enter Hub
