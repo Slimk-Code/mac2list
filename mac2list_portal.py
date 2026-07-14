@@ -12,6 +12,7 @@ import os
 import math
 import time
 import sys
+import subprocess
 import threading
 import glob
 from datetime import datetime
@@ -2597,6 +2598,7 @@ def show_watch_submenu(json_mgr):
 
 def run_watch_submenu(json_mgr):
     """Watch sub-menu loop."""
+    get_vlc_path(json_mgr)
     while True:
         show_watch_submenu(json_mgr)
         choice = input("  > ").strip().upper()
@@ -2663,7 +2665,43 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
 # ============================================================
 # WATCH VIEWERS (read-only, paginated)
 # ============================================================
-def paginated_browse(items, title, headers, row_fmt_fn, page_size=20):
+def get_vlc_path(json_mgr):
+    """Ask user for VLC path once, store in session _meta."""
+    meta = json_mgr.data.setdefault("_meta", {})
+    if meta.get("vlc_path"):
+        p = meta["vlc_path"]
+        if os.path.isfile(p):
+            return p
+    print("  VLC not configured. Enter path to vlc.exe")
+    print("  Example: C:\\Program Files\\VideoLAN\\VLC\\vlc.exe")
+    path = input("  > ").strip().strip('"')
+    if not path or not os.path.isfile(path):
+        print("  Invalid path, VLC playback disabled.")
+        return None
+    meta["vlc_path"] = path
+    json_mgr.save()
+    return path
+
+
+def play_in_vlc(vlc_path, urls, names=None):
+    """Play URLs in VLC. Single URL -> direct. Multiple -> temp M3U (overwritten each time)."""
+    if not vlc_path or not urls:
+        return
+    if len(urls) == 1:
+        subprocess.Popen([vlc_path, urls[0]])
+    else:
+        lines = ["#EXTM3U"]
+        for i, url in enumerate(urls):
+            label = names[i] if names and i < len(names) else "Track {}".format(i + 1)
+            lines.append("#EXTINF:-1,{}".format(label))
+            lines.append(url)
+        tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playlist.m3u")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        subprocess.Popen([vlc_path, tmp])
+
+
+def paginated_browse(items, title, headers, row_fmt_fn, page_size=20, get_urls_fn=None, vlc_path=None):
     """Generic paginated read-only browser."""
     total = len(items)
     if total == 0:
@@ -2691,19 +2729,43 @@ def paginated_browse(items, title, headers, row_fmt_fn, page_size=20):
             print(row_fmt_fn(items[i], i + 1))
 
         print()
-        if max_page > 0:
-            if page < max_page:
-                print("  [Enter] Next page  |  [B] Back")
+        if get_urls_fn:
+            if max_page > 0:
+                if page < max_page:
+                    print("  [Enter] Next page  |  [1-{}] Play  |  [B] Back".format(end - start))
+                else:
+                    print("  [Enter] First page  |  [1-{}] Play  |  [B] Back".format(end - start))
             else:
-                print("  [Enter] First page  |  [B] Back")
+                print("  [1-{}] Play  |  [B] Back".format(end - start))
         else:
-            print("  [B] Back")
+            if max_page > 0:
+                if page < max_page:
+                    print("  [Enter] Next page  |  [B] Back")
+                else:
+                    print("  [Enter] First page  |  [B] Back")
+            else:
+                print("  [B] Back")
 
         choice = input("  > ").strip().upper()
         if choice == "B":
             break
         elif choice == "" and max_page > 0:
             page = (page + 1) % (max_page + 1)
+        elif get_urls_fn and choice.isdigit():
+            num = int(choice)
+            if 1 <= num <= end - start:
+                item = items[start + num - 1]
+                result = get_urls_fn(item)
+                if result:
+                    if isinstance(result[0], tuple):
+                        names = [r[0] for r in result]
+                        urls  = [r[1] for r in result]
+                    else:
+                        names = None
+                        urls  = result
+                    print("  Playing...")
+                    play_in_vlc(vlc_path, urls, names=names)
+                    time.sleep(1)
 
 
 def watch_live(json_mgr):
@@ -2720,13 +2782,15 @@ def watch_live(json_mgr):
         return
 
     def fmt(item, idx):
-        name = item.get("name", "Unknown")[:34]
-        resolved = item.get("resolved_url", "")
-        status = "[x]" if resolved else "[]"
-        url = resolved[:28] if resolved else "(unresolved)"
-        return "{:<4} {:<6} {:<34} {:<28}".format(idx, status, name, url)
+        name = item.get("name", "Unknown")[:50]
+        return "  {:<4} {}".format(idx, name)
 
-    paginated_browse(items, "Live Channels", ["#", "Status", "Name", "URL"], fmt)
+    def get_urls(item):
+        url = item.get("resolved_url", "")
+        return [(item.get("name", ""), url)] if url else []
+
+    paginated_browse(items, "Live Channels", ["#", "Name"], fmt,
+                     get_urls_fn=get_urls, vlc_path=json_mgr.data.get("_meta", {}).get("vlc_path"))
 
 
 def watch_movies(json_mgr):
@@ -2743,13 +2807,15 @@ def watch_movies(json_mgr):
         return
 
     def fmt(item, idx):
-        name = item.get("name", "Unknown")[:34]
-        resolved = item.get("resolved_url", "")
-        status = "[x]" if resolved else "[]"
-        url = resolved[:28] if resolved else "(unresolved)"
-        return "{:<4} {:<6} {:<34} {:<28}".format(idx, status, name, url)
+        name = item.get("name", "Unknown")[:50]
+        return "  {:<4} {}".format(idx, name)
 
-    paginated_browse(items, "VOD Movies", ["#", "Status", "Name", "URL"], fmt)
+    def get_urls(item):
+        url = item.get("resolved_url", "")
+        return [(item.get("name", ""), url)] if url else []
+
+    paginated_browse(items, "VOD Movies", ["#", "Name"], fmt,
+                     get_urls_fn=get_urls, vlc_path=json_mgr.data.get("_meta", {}).get("vlc_path"))
 
 
 def watch_series(json_mgr):
@@ -2772,7 +2838,7 @@ def watch_series(json_mgr):
         return
 
     def fmt(item, idx):
-        name = item.get("name", "Unknown")[:34]
+        name = item.get("name", "Unknown")[:50]
         seasons = item.get("seasons", [])
         total_eps = sum(len(se.get("episodes", [])) for se in seasons)
         resolved = 0
@@ -2780,10 +2846,22 @@ def watch_series(json_mgr):
             for ep in se.get("episodes", []):
                 if se.get("resolved_ep_{}".format(ep)):
                     resolved += 1
-        status = "[x]" if resolved == total_eps and total_eps > 0 else "[]"
-        return "{:<4} {:<6} {:<34} {:>3}/{} eps".format(idx, status, name, resolved, total_eps)
+        return "  {:<4} {} ({}/{})".format(idx, name, resolved, total_eps)
 
-    paginated_browse(items, "Series", ["#", "Status", "Name", "Resolved"], fmt)
+    def get_urls(item):
+        urls = []
+        series_name = item.get("name", "")
+        for se in item.get("seasons", []):
+            season_num = se.get("season", "")
+            for ep in se.get("episodes", []):
+                url = se.get("resolved_ep_{}".format(ep))
+                if url:
+                    label = "{} S{}E{}".format(series_name, season_num, ep)
+                    urls.append((label, url))
+        return urls
+
+    paginated_browse(items, "Series", ["#", "Name"], fmt,
+                     get_urls_fn=get_urls, vlc_path=json_mgr.data.get("_meta", {}).get("vlc_path"))
 
 
 # ============================================================
