@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IPTV Portal JSON Extractor v18
+mac2list v1.2
 State-machine filesystem: each step gets its own JSON file.
 Sessions are fully isolated under data/cache/<session_id>/.
 Consolidated resume file lives in data/session/.
@@ -143,7 +143,7 @@ STEP_FILE_MAP = {
     "G1": "06_convert/01_generate.json",
 }
 
-class IPTVPortal:
+class Mac2ListPortal:
     def __init__(self, base_url, mac_address):
         self.base_url = base_url.rstrip("/")
         self.mac = mac_address.upper().strip()
@@ -481,6 +481,12 @@ class CacheManager:
         """Build and return the consolidated data dict from all step files."""
         session = self.load_session()
         if session:
+            # Backfill scraped_at for old sessions
+            meta = session.get("_meta", {})
+            cat_codes = ["C2", "D1", "E1"]
+            if not meta.get("scraped_at") and all(c in meta.get("done_steps", []) for c in cat_codes):
+                meta["scraped_at"] = meta.get("created", "")
+                session["_meta"] = meta
             return session
         # Build skeleton from scratch
         return {
@@ -489,6 +495,7 @@ class CacheManager:
                 "portal": "",
                 "mac": "",
                 "last_step": "",
+                "scraped_at": "",
                 "ignored_steps": [],
                 "done_steps": []
             },
@@ -554,6 +561,11 @@ class JSONManager:
             self.data["_meta"]["done_steps"] = done
             self.update_last_step(step_code)
             self.save()
+            # Set scraped_at only when a category step completes and all 3 are now done
+            cat_codes = ["C2", "D1", "E1"]
+            if step_code in cat_codes and all(c in done for c in cat_codes):
+                self.data["_meta"]["scraped_at"] = datetime.now().isoformat()
+                self.save()
         # Mirror status into the individual step file
         self.cache.mark_done(step_code)
 
@@ -806,6 +818,34 @@ class JSONManager:
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
+def _time_ago(iso_str):
+    if not iso_str:
+        return "Unknown"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        delta = datetime.now() - dt
+        secs = int(delta.total_seconds())
+        if secs < 60:
+            return "just now"
+        mins = secs // 60
+        if mins < 60:
+            return "{} min ago".format(mins)
+        hours = mins // 60
+        if hours < 24:
+            return "{} hours ago".format(hours)
+        days = hours // 24
+        return "{} days ago".format(days)
+    except Exception:
+        return "Unknown"
+
+def _cooldown(seconds=5):
+    for i in range(seconds, 0, -1):
+        sys.stdout.write("\r  Continuing in {}s...  ".format(i))
+        sys.stdout.flush()
+        time.sleep(1)
+    sys.stdout.write("\r" + " " * 40 + "\r")
+    sys.stdout.flush()
+
 def progress_bar(current, total, prefix="", width=30):
     if total <= 0:
         pct = 100.0
@@ -1019,16 +1059,16 @@ def view_categories(json_mgr, section, client=None):
         if total_pending == 0:
             print("  -> [OK] All categories fetched. {} done, {} failed.".format(len(fetched), len(failed)))
             print()
-            print("  [Enter] Next page  |  [D] Done")
+            print("  [Enter] Next page  |  [B] Back")
         else:
-            print("  [Enter] Next page  |  [A] Fetch ALL  |  [1-{}] Select #  |  [D] Done".format(end - start))
+            print("  [Enter] Next page  |  [A] Fetch ALL  |  [1-{}] Select #  |  [B] Back".format(end - start))
         choice = input("  > ").strip().upper()
         if choice == "A":
             if total_pending > 0:
                 to_fetch_ids = [str(c.get("id")) for c in pending]
                 break
             # else: ignore when nothing pending
-        elif choice == "D":
+        elif choice == "B":
             return "done" if total_pending == 0 else None
         elif choice == "":
             if page < max_page:
@@ -1121,7 +1161,7 @@ def _fetch_single_category(client, json_mgr, section, cat_id, action_type, actio
 # ITEMS HANDLER - opens viewer directly, no sub-menu
 # ============================================================
 def run_episodes_step(client, json_mgr):
-    """Fetch episodes for selected series. Loops until user presses Done."""
+    """Fetch episodes for selected series. Loops until user presses Back."""
     cache = getattr(json_mgr, "cache", None)
     existing_responses = []
     if cache:
@@ -1143,7 +1183,7 @@ def run_episodes_step(client, json_mgr):
                 series_items.append(item)
         if not series_items:
             print("  No series available. Fetch series first.")
-            input("  Press Enter to continue...")
+            _cooldown()
             return False
 
         page_size = 20
@@ -1160,7 +1200,7 @@ def run_episodes_step(client, json_mgr):
             max_page = (total - 1) // page_size
             if total == 0:
                 print("  No series available.")
-                input("  Press Enter to continue...")
+                _cooldown()
                 return False
 
             clear_screen()
@@ -1189,16 +1229,16 @@ def run_episodes_step(client, json_mgr):
             if total_pending == 0:
                 print("  -> [OK] All series fetched. {}/{} items.".format(len(fetched), total))
                 print()
-                print("  [Enter] Next page  |  [D] Done")
+                print("  [Enter] Next page  |  [B] Back")
             else:
-                print("  [A] Fetch ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
+                print("  [A] Fetch ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [B] Back".format(end - start))
             choice = input("  > ").strip().upper()
             if choice == "A":
                 if total_pending > 0:
                     to_fetch = pending[:]
                 else:
                     continue
-            elif choice == "D":
+            elif choice == "B":
                 return "done" if total_pending == 0 else None
             elif choice == "":
                 if page < max_page:
@@ -1415,7 +1455,7 @@ def batch_fetch_section(client, json_mgr, section):
 def print_section_status(current_step_idx, json_mgr):
     clear_screen()
     print("=" * 60)
-    print("   IPTV Portal JSON Extractor v17 — Linear Flow")
+    print("   mac2list v1.2 — Linear Flow")
     print("=" * 60)
     print()
     flat_idx = 0
@@ -1445,7 +1485,7 @@ def print_section_status(current_step_idx, json_mgr):
 
             status = ""
             if done_count == total_count:
-                status = " [all done]"
+                status = " [complete]"
             elif done_count > 0 or ignored_count > 0:
                 status = " [{}/{} done]".format(done_count, total_count)
             print("  {}. {}{}".format(sec_num, sec["title"], status))
@@ -1501,10 +1541,10 @@ def run_batch_step(client, json_mgr, step_code):
 # RESOLVE HANDLER - shows list view, user picks by number
 # ============================================================
 def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
-    """Shared resolver for C4 and D3. Loops until user presses Done."""
+    """Shared resolver for C4 and D3. Loops until user presses Back."""
     if not items:
         print("  No items available. Fetch items first.")
-        input("  Press Enter to continue...")
+        _cooldown()
         return False
 
     page_size = 20
@@ -1533,7 +1573,7 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
         max_page = (total - 1) // page_size
         if total == 0:
             print("  No items available.")
-            input("  Press Enter to continue...")
+            _cooldown()
             return True
 
         clear_screen()
@@ -1562,14 +1602,14 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
         if total_pending == 0:
             print("  -> [OK] All items resolved. {}/{} items.".format(len(resolved), total))
             print()
-            print("  [Enter] Next page  |  [D] Done")
+            print("  [Enter] Next page  |  [B] Back")
         else:
-            print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
+            print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [B] Back".format(end - start))
         choice = input("  > ").strip().upper()
         if choice == "A":
             if total_pending > 0:
                 to_resolve = pending[:]
-        elif choice == "D":
+        elif choice == "B":
             return "done" if total_pending == 0 else None
         elif choice == "":
             if page < max_page:
@@ -1674,7 +1714,7 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
 
 
 def _resolve_episodes(client, json_mgr, step_code):
-    """E4: Series -> Episodes -> Resolve. Loops until user presses Done."""
+    """E4: Series -> Episodes -> Resolve. Loops until user presses Back."""
     cache = getattr(json_mgr, "cache", None)
     existing_responses = []
     if cache:
@@ -1699,7 +1739,7 @@ def _resolve_episodes(client, json_mgr, step_code):
 
         if not series_items:
             print("  No series available. Fetch series first.")
-            input("  Press Enter to continue...")
+            _cooldown()
             return False
 
         page_size = 20
@@ -1724,7 +1764,7 @@ def _resolve_episodes(client, json_mgr, step_code):
             max_page = (total - 1) // page_size
             if total == 0:
                 print("  No series available.")
-                input("  Press Enter to continue...")
+                _cooldown()
                 return False
 
             clear_screen()
@@ -1753,16 +1793,16 @@ def _resolve_episodes(client, json_mgr, step_code):
             if total_pending == 0:
                 print("  -> [OK] All series episodes resolved. {}/{} items.".format(len(resolved), total))
                 print()
-                print("  [Enter] Next page  |  [D] Done")
+                print("  [Enter] Next page  |  [B] Back")
             else:
-                print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [D] Done".format(end - start))
+                print("  [A] Resolve ALL  |  [Enter] Next page  |  [1-{}] Select #  |  [B] Back".format(end - start))
             choice = input("  > ").strip().upper()
             if choice == "A":
                 if total_pending > 0:
                     # Resolve ALL episodes for ALL pending series
                     selected_series = "ALL"
                     break
-            elif choice == "D":
+            elif choice == "B":
                 return "done" if total_pending == 0 else None
             elif choice == "":
                 page = (page + 1) if page < max_page else 0
@@ -2079,7 +2119,7 @@ def show_resume_menu(sessions, reveal_new=False, portal="", mac=""):
     """Display landing page. If reveal_new=True, show Portal/MAC inputs inline."""
     clear_screen()
     print("=" * 60)
-    print("   IPTV Portal JSON Extractor v18")
+    print("   mac2list v1.2")
     print("=" * 60)
     print()
 
@@ -2202,29 +2242,42 @@ def run_resume_or_new():
 # ============================================================
 # PAGE 2 — MAIN HUB
 # ============================================================
+def _section_status(json_mgr, section_key, item_label):
+    sec = json_mgr.data.get(section_key, {})
+    cats = sec.get("categories", [])
+    if section_key == "live":
+        resolved = sum(1 for c in cats for ch in c.get("channels", []) if ch.get("resolved_url"))
+    elif section_key == "movies":
+        resolved = sum(1 for c in cats for m in c.get("items", []) if m.get("resolved_url"))
+    else:
+        resolved = sum(1 for c in cats for s in c.get("items", []) if any(se.get("resolved_ep_{}".format(ep)) for se in s.get("seasons", []) for ep in se.get("episodes", [])))
+    grand_total = sec.get("grand_total", 0)
+    if grand_total == 0:
+        return "Not fetched"
+    return "{}/{} {}".format(resolved, grand_total, item_label)
+
 def show_hub_header(json_mgr):
     """Print hub header/menu without input prompt."""
     clear_screen()
     print("=" * 60)
-    print("   IPTV Portal JSON Extractor v17 — Main Hub")
+    print("   mac2list v1.2 — Main Hub")
     print("=" * 60)
     print()
 
     cat_codes = ["C2", "D1", "E1"]
     cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
-    cat_status = "[all done]" if cat_done == len(cat_codes) else "[{}/{} done]".format(cat_done, len(cat_codes))
-
-    def section_status(sec_key):
-        sec = SECTIONS[sec_key]
-        done = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
-        total = len(sec["items"])
-        return "{}/{} done".format(done, total)
+    if cat_done == 0:
+        cat_status = "Not scraped"
+    elif cat_done < len(cat_codes):
+        cat_status = "{}/{} scraped".format(cat_done, len(cat_codes))
+    else:
+        cat_status = "Updated " + _time_ago(json_mgr.data["_meta"].get("scraped_at", ""))
 
     live_count = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
     movie_count = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
     series_count = sum(1 for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", []) if any(se.get("resolved_ep_{}".format(ep)) for se in s.get("seasons", []) for ep in se.get("episodes", [])))
 
-    convert_status = "Done" if json_mgr.is_done("G1") else "Ready"
+    convert_status = "Exported" if json_mgr.is_done("G1") else "Ready"
 
     settings_done = sum(1 for code in SETTINGS_STEP_CODES if json_mgr.is_done(code))
     settings_total = len(SETTINGS_STEP_CODES)
@@ -2235,9 +2288,9 @@ def show_hub_header(json_mgr):
 
     print("  [1] Scrape Categories  —  {}".format(cat_status))
     print()
-    print("  [2] Live Channels      —  {}".format(section_status("Live Channels")))
-    print("  [3] VOD Movies         —  {}".format(section_status("VOD Movies")))
-    print("  [4] Series             —  {}".format(section_status("Series")))
+    print("  [2] Live Channels      —  {}".format(_section_status(json_mgr, "live", "ch")))
+    print("  [3] VOD Movies         —  {}".format(_section_status(json_mgr, "movies", "movies")))
+    print("  [4] Series             —  {}".format(_section_status(json_mgr, "series", "series")))
     print()
     print("  [5] Watch              —  {} ch, {} movies, {} series".format(live_count, movie_count, series_count))
     print("  [6] Convert            —  {}".format(convert_status))
@@ -2253,29 +2306,28 @@ def show_hub(json_mgr):
     """Display Main Hub. Returns user choice string."""
     clear_screen()
     print("=" * 60)
-    print("   IPTV Portal JSON Extractor v17 — Main Hub")
+    print("   mac2list v1.2 — Main Hub")
     print("=" * 60)
     print()
 
     # Scrape categories status
     cat_codes = ["C2", "D1", "E1"]
     cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
-    cat_status = "[all done]" if cat_done == len(cat_codes) else "[{}/{} done]".format(cat_done, len(cat_codes))
+    if cat_done == 0:
+        cat_status = "Not scraped"
+    elif cat_done < len(cat_codes):
+        cat_status = "{}/{} scraped".format(cat_done, len(cat_codes))
+    else:
+        cat_status = "Updated " + _time_ago(json_mgr.data["_meta"].get("scraped_at", ""))
 
     # Per-section status
-    def section_status(sec_key):
-        sec = SECTIONS[sec_key]
-        done = sum(1 for code, _, _, _ in sec["items"] if json_mgr.is_done(code))
-        total = len(sec["items"])
-        return "{}/{} done".format(done, total)
-
     # Watch counts
     live_count = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
     movie_count = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
     series_count = sum(1 for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", []) if any(se.get("resolved_ep_{}".format(ep)) for se in s.get("seasons", []) for ep in se.get("episodes", [])))
 
     # Convert
-    convert_status = "Done" if json_mgr.is_done("G1") else "Ready"
+    convert_status = "Exported" if json_mgr.is_done("G1") else "Ready"
 
     # Settings
     settings_done = sum(1 for code in SETTINGS_STEP_CODES if json_mgr.is_done(code))
@@ -2288,9 +2340,9 @@ def show_hub(json_mgr):
 
     print("  [1] Scrape Categories  —  {}".format(cat_status))
     print()
-    print("  [2] Live Channels      —  {}".format(section_status("Live Channels")))
-    print("  [3] VOD Movies         —  {}".format(section_status("VOD Movies")))
-    print("  [4] Series             —  {}".format(section_status("Series")))
+    print("  [2] Live Channels      —  {}".format(_section_status(json_mgr, "live", "ch")))
+    print("  [3] VOD Movies         —  {}".format(_section_status(json_mgr, "movies", "movies")))
+    print("  [4] Series             —  {}".format(_section_status(json_mgr, "series", "series")))
     print()
     print("  [5] Watch              —  {} ch, {} movies, {} series".format(live_count, movie_count, series_count))
     print("  [6] Convert            —  {}".format(convert_status))
@@ -2320,6 +2372,22 @@ def hub_loop(client, json_mgr, is_restored):
             sys.exit(0)
         elif choice == "1":
             cat_codes = ["C2", "D1", "E1"]
+            all_done = all(json_mgr.is_done(c) for c in cat_codes)
+            if all_done:
+                show_hub_header(json_mgr)
+                print("  Already scraped.")
+                ans = input("  Re-scrape? [Y/N] > ").strip().upper()
+                if ans != "Y":
+                    continue
+                # Reset steps so they re-run
+                for c in cat_codes:
+                    if json_mgr.is_done(c):
+                        done = json_mgr.data["_meta"].get("done_steps", [])
+                        if c in done:
+                            done.remove(c)
+                            json_mgr.data["_meta"]["done_steps"] = done
+                json_mgr.data["_meta"]["scraped_at"] = ""
+                json_mgr.save()
             while True:
                 next_code = get_next_pending_step(json_mgr, cat_codes)
                 if next_code is None:
@@ -2352,30 +2420,30 @@ def _step_progress(json_mgr, code):
         cats = json_mgr.data["live"].get("categories", [])
         total = len([c for c in cats if str(c.get("id")) != "*"])
         fetched = len(json_mgr.get_live_fetched())
-        return "{}/{} fetched".format(fetched, total)
+        return "{}/{} categories".format(fetched, total)
     elif code == "C4":
         total = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []))
         resolved = sum(1 for c in json_mgr.data["live"].get("categories", []) for ch in c.get("channels", []) if ch.get("resolved_url"))
-        return "{}/{} resolved".format(resolved, total)
+        return "{}/{} channels".format(resolved, total)
     elif code == "D4":
         cats = json_mgr.data["movies"].get("categories", [])
         total = len([c for c in cats if str(c.get("id")) != "*"])
         fetched = len(json_mgr.get_movie_fetched())
-        return "{}/{} fetched".format(fetched, total)
+        return "{}/{} categories".format(fetched, total)
     elif code == "D3":
         total = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []))
         resolved = sum(1 for c in json_mgr.data["movies"].get("categories", []) for m in c.get("items", []) if m.get("resolved_url"))
-        return "{}/{} resolved".format(resolved, total)
+        return "{}/{} movies".format(resolved, total)
     elif code == "E5":
         cats = json_mgr.data["series"].get("categories", [])
         total = len([c for c in cats if str(c.get("id")) != "*"])
         fetched = len(json_mgr.get_series_fetched())
-        return "{}/{} fetched".format(fetched, total)
+        return "{}/{} categories".format(fetched, total)
     elif code == "E3":
         all_series = [s for c in json_mgr.data["series"].get("categories", []) for s in c.get("items", [])]
         total = len(all_series)
         fetched = sum(1 for s in all_series if s.get("seasons"))
-        return "{}/{} fetched".format(fetched, total)
+        return "{}/{} series".format(fetched, total)
     elif code == "E4":
         total_eps = 0
         resolved_eps = 0
@@ -2386,9 +2454,9 @@ def _step_progress(json_mgr, code):
                         total_eps += 1
                         if se.get("resolved_ep_{}".format(ep)):
                             resolved_eps += 1
-        return "{}/{} resolved".format(resolved_eps, total_eps)
+        return "{}/{} episodes".format(resolved_eps, total_eps)
     elif json_mgr.is_done(code):
-        return "done"
+        return "complete"
     return "pending"
 
 
@@ -2412,9 +2480,9 @@ def run_section_submenu(client, json_mgr, sec_key, skip=None):
 
         print()
         if len(visible_items) > 1:
-            print("  [1-{}] Pick step  |  [B] Back to Hub".format(len(visible_items)))
+            print("  [1-{}] Pick step  |  [B] Back".format(len(visible_items)))
         else:
-            print("  [1] Pick step  |  [B] Back to Hub")
+            print("  [1] Pick step  |  [B] Back")
 
         choice = input("  > ").strip().upper()
         if choice == "B":
@@ -2452,7 +2520,7 @@ def print_settings_submenu(json_mgr):
         print("  {} {:<50} {}".format(mark, desc, info))
 
     print()
-    print("  [Enter] Continue next pending  |  [B] Back to Hub")
+    print("  [Enter] Continue next pending  |  [B] Back")
 
 
 def run_settings_submenu(client, json_mgr):
@@ -2466,7 +2534,7 @@ def run_settings_submenu(client, json_mgr):
             next_code = get_next_pending_step(json_mgr, SETTINGS_STEP_CODES)
             if next_code is None:
                 print("  -> [OK] All settings steps complete.")
-                input("  Press Enter to continue...")
+                _cooldown()
             else:
                 idx, sec_key, desc, info, is_auto = get_step_info(next_code)
                 run_single_step(client, json_mgr, next_code, desc, info, is_auto)
@@ -2563,7 +2631,7 @@ def run_convert_submenu(json_mgr):
     print("     Movies: {}".format(files.get("movies", "")))
     print("     Series: {}".format(files.get("series", "")))
     print()
-    print("  [R] Regenerate  |  [B] Back to Hub")
+    print("  [R] Regenerate  |  [B] Back")
     choice = input("  > ").strip().upper()
     if choice == "R":
         files = generate_m3u(json_mgr)
@@ -2571,7 +2639,7 @@ def run_convert_submenu(json_mgr):
         print("     Live:   {}".format(files.get("live", "")))
         print("     Movies: {}".format(files.get("movies", "")))
         print("     Series: {}".format(files.get("series", "")))
-    input("  Press Enter to continue...")
+        _cooldown()
 
 
 # ============================================================
@@ -2593,7 +2661,7 @@ def show_watch_submenu(json_mgr):
     print("  [2] VOD Movies        —  {} movies".format(movie_count))
     print("  [3] Series            —  {} series".format(series_count))
     print()
-    print("  [B] Back to Hub")
+    print("  [B] Back")
 
 
 def run_watch_submenu(json_mgr):
@@ -2657,8 +2725,9 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
             print(step_msg)
         print("  -> [..] {} — not complete yet.".format(desc))
 
-    print()
-    input("  Press Enter to continue...")
+    if success or step_msg:
+        print()
+        _cooldown()
     return success
 
 
@@ -2706,7 +2775,7 @@ def paginated_browse(items, title, headers, row_fmt_fn, page_size=20, get_urls_f
     total = len(items)
     if total == 0:
         print("  No items available.")
-        input("  Press Enter to continue...")
+        _cooldown()
         return
 
     page = 0
@@ -2778,7 +2847,7 @@ def watch_live(json_mgr):
 
     if not items:
         print("  No channels available. Fetch channels first (Scrape → Live).")
-        input("  Press Enter to continue...")
+        _cooldown()
         return
 
     def fmt(item, idx):
@@ -2803,7 +2872,7 @@ def watch_movies(json_mgr):
 
     if not items:
         print("  No movies available. Fetch movies first (Scrape → VOD).")
-        input("  Press Enter to continue...")
+        _cooldown()
         return
 
     def fmt(item, idx):
@@ -2834,7 +2903,7 @@ def watch_series(json_mgr):
 
     if not items:
         print("  No series available. Fetch series first (Scrape → Series).")
-        input("  Press Enter to continue...")
+        _cooldown()
         return
 
     def fmt(item, idx):
@@ -2873,7 +2942,7 @@ def main():
     if not portal or not mac or not json_mgr:
         return
 
-    client = IPTVPortal(portal, mac)
+    client = Mac2ListPortal(portal, mac)
 
     # Handshake always runs (silent in background)
     handshake_result = client.handshake()
@@ -2900,7 +2969,7 @@ def main():
     print_section_status(len(FLAT_STEPS), json_mgr)
     print("\nAll steps complete!")
     print("\n" + "=" * 60)
-    print("   Done! All fetched data saved.")
+    print("   All fetched data saved.")
     print("=" * 60)
 
 
