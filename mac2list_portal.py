@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DATA_DIR    = "data"
 SESSION_DIR = "data/session"
 CACHE_DIR   = "data/cache"
-OUTPUT_DIR  = "output"
+OUTPUT_DIR  = "data/output"
 
 
 def make_session_id(base_url, mac):
@@ -1652,7 +1652,20 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
             result = client.fetch(params)
             data = result.get("_data")
             if action_type == "itv":
-                resolved_url = cmd[7:] if cmd.startswith("ffmpeg ") else cmd
+                server_cmd = None
+                if data and isinstance(data, dict):
+                    js_val = data.get("js")
+                    if isinstance(js_val, str):
+                        server_cmd = js_val
+                    elif isinstance(js_val, dict):
+                        server_cmd = js_val.get("cmd")
+                resolved_url = server_cmd or ""
+                m_res = re.search(r"[?&]stream=([^&]*)", resolved_url)
+                if m_res and m_res.group(1) == "":
+                    resolved_url = re.sub(r"stream=[^&]*",
+                                          "stream=" + str(item.get("id", "")),
+                                          resolved_url, count=1)
+                resolved_url = resolved_url[7:] if resolved_url.startswith("ffmpeg ") else resolved_url
                 item["resolved_url"] = resolved_url
                 json_mgr.save()
                 existing_responses.append({
@@ -2082,37 +2095,25 @@ def scan_existing_sessions():
                 meta = data.get("_meta", {})
                 portal = meta.get("portal", "unknown")
                 mac = meta.get("mac", "unknown")
-                last_step = meta.get("last_step", "")
-                done = meta.get("done_steps", [])
-                ignored = meta.get("ignored_steps", [])
                 sessions.append({
                     "file": f,
                     "portal": portal,
                     "mac": mac,
-                    "last_step": last_step,
-                    "done_count": len(done),
-                    "ignored_count": len(ignored)
+                    "phone": (data.get("account") or {}).get("phone", "")
                 })
         except:
             pass
     return sessions
 
-STEP_NAME_MAP = {
-    "A1": "Handshake", "A2": "STB Profile",
-    "B1": "Account Main Info", "B2": "Account Details", "B3": "Tariff Plans",
-    "C2": "Live Categories", "C5": "Live Channels", "C4": "Live Resolve",
-    "D1": "VOD Categories", "D4": "VOD Movies", "D3": "VOD Resolve",
-    "E1": "Series Categories", "E5": "Series Items", "E3": "Episodes", "E4": "Series Resolve",
-    "F1": "Portal Settings", "F2": "Parental Lock", "F3": "Unlock Adult",
-    "G1": "Generate M3U",
-}
 
-
-def _human_last_step(last_step):
-    if not last_step:
-        return "Start"
-    name = STEP_NAME_MAP.get(last_step, last_step)
-    return "{} ({})".format(name, last_step)
+def _expiry_label(phone):
+    if not phone:
+        return ""
+    try:
+        dt = datetime.strptime(str(phone).strip(), "%B %d, %Y, %I:%M %p")
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return ""
 
 
 def show_resume_menu(sessions, reveal_new=False, portal="", mac=""):
@@ -2123,17 +2124,12 @@ def show_resume_menu(sessions, reveal_new=False, portal="", mac=""):
     print("=" * 60)
     print()
 
-    total_steps = len(FLAT_STEPS)
-
     # Restore sessions
     for i, s in enumerate(sessions, 1):
-        done = s["done_count"]
-        ignored = s["ignored_count"]
-        total_done = done + ignored
-        last = _human_last_step(s.get("last_step", ""))
         print("  [{}] Restore session".format(i))
         print("      {}  |  {}".format(s["portal"], s["mac"]))
-        print("      Progress: {}/{} steps  |  Last: {}".format(total_done, total_steps, last))
+        expiry = _expiry_label(s.get("phone", ""))
+        print("      Expiry: {}".format(expiry if expiry else "—"))
         print()
 
     # New session
@@ -2298,7 +2294,7 @@ def show_hub_header(json_mgr):
     print("  [7] Settings           —  {}/{} done".format(settings_done, settings_total))
     print("  [8] Auth               —  {}/{} done".format(auth_done, auth_total))
     print()
-    print("  [Q] Quit")
+    print("  [B] Back")
     print()
 
 
@@ -2350,7 +2346,7 @@ def show_hub(json_mgr):
     print("  [7] Settings           —  {}/{} done".format(settings_done, settings_total))
     print("  [8] Auth               —  {}/{} done".format(auth_done, auth_total))
     print()
-    print("  [Q] Quit")
+    print("  [B] Back")
     print()
 
     return input("  > ").strip().upper()
@@ -2367,9 +2363,8 @@ def hub_loop(client, json_mgr, is_restored):
 
     while True:
         choice = show_hub(json_mgr)
-        if choice == "Q":
-            print("  Quitting...")
-            sys.exit(0)
+        if choice == "B":
+            break
         elif choice == "1":
             cat_codes = ["C2", "D1", "E1"]
             all_done = all(json_mgr.is_done(c) for c in cat_codes)
@@ -2764,7 +2759,8 @@ def play_in_vlc(vlc_path, urls, names=None):
             label = names[i] if names and i < len(names) else "Track {}".format(i + 1)
             lines.append("#EXTINF:-1,{}".format(label))
             lines.append(url)
-        tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playlist.m3u")
+        tmp = os.path.join(OUTPUT_DIR, "temp_series_vlc.m3u")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         subprocess.Popen([vlc_path, tmp])
@@ -2937,40 +2933,43 @@ def watch_series(json_mgr):
 # MAIN
 # ============================================================
 def main():
-    portal, mac, json_mgr, is_restored = run_resume_or_new()
+    while True:
+        portal, mac, json_mgr, is_restored = run_resume_or_new()
 
-    if not portal or not mac or not json_mgr:
-        return
+        if not portal or not mac or not json_mgr:
+            return
 
-    client = Mac2ListPortal(portal, mac)
+        client = Mac2ListPortal(portal, mac)
 
-    # Handshake always runs (silent in background)
-    handshake_result = client.handshake()
-    handshake_data = handshake_result.get("_data")
-    status = handshake_result.get("_status")
-    url = handshake_result.get("_url")
-    error_msg = handshake_result.get("_error")
-    lockedpath = handshake_result.get("_lockedpath")
-    if not client.token:
-        print("[!] Handshake failed — no token received.")
+        # Handshake always runs (silent in background)
+        handshake_result = client.handshake()
+        handshake_data = handshake_result.get("_data")
+        status = handshake_result.get("_status")
+        url = handshake_result.get("_url")
+        error_msg = handshake_result.get("_error")
+        lockedpath = handshake_result.get("_lockedpath")
+        if not client.token:
+            print("[!] Handshake failed — no token received.")
+            cache = getattr(json_mgr, "cache", None)
+            fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath, cache=cache)
+            print("  -> Saved error to {}".format(fname))
+            return
+
         cache = getattr(json_mgr, "cache", None)
-        fname = save_error_json("A1", "handshake", status, url, error_msg, lockedpath, cache=cache)
-        print("  -> Saved error to {}".format(fname))
-        return
+        save_json(handshake_data, "A1", "handshake", cache=cache)
+        json_mgr.mark_done("A1")
 
-    cache = getattr(json_mgr, "cache", None)
-    save_json(handshake_data, "A1", "handshake", cache=cache)
-    json_mgr.mark_done("A1")
+        # On first launch (new session), fetch profile + account info once (no cooldown)
+        if not is_restored:
+            for code in ("A2", "B1"):
+                _, _, desc, info, is_auto = get_step_info(code)
+                ok, msg = run_auto_fetch_step(client, json_mgr, code, desc)
+                if ok:
+                    json_mgr.mark_done(code)
+            print("  -> [OK] Profile & account info saved.")
 
-    # Enter Hub
-    hub_loop(client, json_mgr, is_restored)
-
-    # Final screen
-    print_section_status(len(FLAT_STEPS), json_mgr)
-    print("\nAll steps complete!")
-    print("\n" + "=" * 60)
-    print("   All fetched data saved.")
-    print("=" * 60)
+        # Enter Hub (returns on [B] Back → session selection)
+        hub_loop(client, json_mgr, is_restored)
 
 
 if __name__ == "__main__":
