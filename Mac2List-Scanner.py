@@ -15,6 +15,7 @@ import time
 from core.config import (
     OUTPUT_DIR,
     SECTIONS,
+    SESSION_DIR,
     STEP_PARAMS,
 )
 from core.convert import generate_m3u
@@ -35,6 +36,7 @@ from core.resolve import (
 from core.sessions import (
     cleanup_orphans as _cleanup_orphans,
     database_sessions as _database_sessions,
+    make_session_id,
 )
 from core.storage import (
     JSONManager,
@@ -44,7 +46,6 @@ from core.storage import (
 )
 from core.utils import (
     domain_of as _domain_of,
-    expiry_label as _expiry_label,
     time_ago as _time_ago,
 )
 
@@ -351,6 +352,23 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
                 return items[num - 1]
 
 
+def _portal_status(session):
+    """Pass, failed - xxx, or pending read from the saved session file."""
+    try:
+        session_id = make_session_id(session.get("portal", ""), session.get("mac", ""))
+        path = os.path.join(SESSION_DIR, session_id + ".json")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        meta = data.get("_meta", {}) if isinstance(data, dict) else {}
+        if meta.get("handshake_status") == "pass":
+            return "pass"
+        if meta.get("handshake_status") == "failed":
+            return "failed - {}".format(meta.get("handshake_reason", "unknown"))
+    except Exception:
+        pass
+    return "pending"
+
+
 def _select_restore_session(sessions):
     """Show all saved sessions in a paged list. Returns chosen session dict or None."""
     if not sessions:
@@ -358,13 +376,12 @@ def _select_restore_session(sessions):
         _cooldown()
         return None
 
-    header_line = "  {:<4} {:<24} {:<19} {}".format("#", "Portal", "MAC", "Expiry")
+    header_line = "  {:<4} {:<24} {:<19} {}".format("#", "Portal", "MAC", "Status")
 
     def row_fmt(s, idx):
         portal = _domain_of(s.get("portal", ""))[:24]
         mac = str(s.get("mac", ""))[:19]
-        expiry = _expiry_label(s.get("phone", ""))
-        return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, expiry if expiry else "—")
+        return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, _portal_status(s))
 
     return _select_paginated(sessions, "Restore Session", header_line, row_fmt)
 
@@ -408,10 +425,15 @@ def run_resume_or_new():
 # Next hub draw prints this under the menu, then clears it.
 _hub_notice = []
 
+# Sequential hub order: one step per Enter press.
+_ORDER = ["A1", "SCRAPE", "C5", "C4", "D4", "D3", "G1"]
+_hub_pos = 0
+
 
 def run_hub_handshake(client, json_mgr):
     """Clear, run handshake, then redraw menu with message under it."""
     global _hub_notice
+    print("  -> Handshake running...")
     success, _ = run_handshake_step(client, json_mgr)
     if success:
         json_mgr.mark_done("A1")
@@ -419,7 +441,7 @@ def run_hub_handshake(client, json_mgr):
     else:
         reason = json_mgr.data.get("_meta", {}).get("handshake_reason", "unknown")
         result_line = "  -> failed - {}".format(reason)
-    _hub_notice = ["  -> Handshake running...", result_line, "  -> saved"]
+    _hub_notice = [result_line, "  -> saved"]
     return success
 
 
@@ -452,27 +474,27 @@ def show_hub_header(json_mgr):
         for _code, _desc, _info, _auto in _sec["items"]:
             _descs[_code] = _desc
 
-    print("  [1] {:<45} {}".format(_descs.get("A1", "A1"), handshake_status(json_mgr)))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 0 else "  ", _descs.get("A1", "A1"), handshake_status(json_mgr)))
     print()
-    print("  [2] {:<45} —  {}".format("Scrape Categories", cat_status))
+    print("  {} {:<45} —  {}".format(">>" if _hub_pos == 1 else "  ", "Scrape Categories", cat_status))
     print()
-    print("  [3] {:<45} {}".format(_descs.get("C5", "C5"), _step_progress(json_mgr, "C5")))
-    print("  [4] {:<45} {}".format(_descs.get("C4", "C4"), _step_progress(json_mgr, "C4")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", _descs.get("C5", "C5"), _step_progress(json_mgr, "C5")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", _descs.get("C4", "C4"), _step_progress(json_mgr, "C4")))
     print()
-    print("  [5] {:<45} {}".format(_descs.get("D4", "D4"), _step_progress(json_mgr, "D4")))
-    print("  [6] {:<45} {}".format(_descs.get("D3", "D3"), _step_progress(json_mgr, "D3")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 4 else "  ", _descs.get("D4", "D4"), _step_progress(json_mgr, "D4")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", _descs.get("D3", "D3"), _step_progress(json_mgr, "D3")))
     print()
-    print("  [7] {:<45} —  {}".format("Convert", convert_status))
+    print("  {} {:<45} —  {}".format(">>" if _hub_pos == 6 else "  ", "Convert", convert_status))
     print()
-    print("  [B] Back")
+    print("  [Enter] Next step | [B] Back")
     print()
+    print("-" * 60)
 
 
 def show_hub(json_mgr):
     """Display Main Hub. Returns user choice string."""
     global _hub_notice
     show_hub_header(json_mgr)
-    print("-" * 60)
     if _hub_notice:
         for line in _hub_notice:
             print(line)
@@ -482,37 +504,47 @@ def show_hub(json_mgr):
 
 
 def hub_loop(client, json_mgr, is_restored):
-    """Main Hub loop."""
+    """Main Hub loop: one step per Enter press, in row order."""
+    global _hub_notice, _hub_pos
+    _hub_notice = ["  -> press Enter to start with handshake"]
+    _hub_pos = 0
     while True:
         choice = show_hub(json_mgr)
         if choice == "B":
             break
-        elif choice == "2":
-            cat_codes = ["C2", "D1"]
-            # Always reset so it scrapes again at once
-            for c in cat_codes:
-                if json_mgr.is_done(c):
-                    done = json_mgr.data["_meta"].get("done_steps", [])
-                    if c in done:
-                        done.remove(c)
-                        json_mgr.data["_meta"]["done_steps"] = done
-            json_mgr.data["_meta"]["scraped_at"] = ""
-            json_mgr.save()
-            while True:
-                next_code = get_next_pending_step(json_mgr, cat_codes)
-                if next_code is None:
-                    break
-                show_hub_header(json_mgr)
-                idx, _, desc, info, is_auto = get_step_info(next_code)
-                run_single_step(client, json_mgr, next_code, desc, info, is_auto)
-        elif choice in ("1", "3", "4", "5", "6"):
-            code = {"1": "A1", "3": "C5", "4": "C4", "5": "D4", "6": "D3"}[choice]
-            idx, _, desc, info, is_auto = get_step_info(code)
-            run_single_step(client, json_mgr, code, desc, info, is_auto)
-        elif choice == "7":
-            run_convert_submenu(json_mgr)
+        elif choice == "":
+            code = _ORDER[_hub_pos]
+            ok = True
+            if code == "SCRAPE":
+                cat_codes = ["C2", "D1"]
+                # Always reset so it scrapes again at once
+                for c in cat_codes:
+                    if json_mgr.is_done(c):
+                        done = json_mgr.data["_meta"].get("done_steps", [])
+                        if c in done:
+                            done.remove(c)
+                            json_mgr.data["_meta"]["done_steps"] = done
+                json_mgr.data["_meta"]["scraped_at"] = ""
+                json_mgr.save()
+                while True:
+                    next_code = get_next_pending_step(json_mgr, cat_codes)
+                    if next_code is None:
+                        break
+                    show_hub_header(json_mgr)
+                    idx, _, desc, info, is_auto = get_step_info(next_code)
+                    if not run_single_step(client, json_mgr, next_code, desc, info, is_auto):
+                        ok = False
+                        break
+            elif code == "G1":
+                run_convert_submenu(json_mgr)
+            else:
+                idx, _, desc, info, is_auto = get_step_info(code)
+                ok = run_single_step(client, json_mgr, code, desc, info, is_auto)
+            if not ok:
+                break
+            _hub_pos = (_hub_pos + 1) % len(_ORDER)
         else:
-            print("  Invalid choice.")
+            print("  Press Enter for next step or [B] Back.")
             time.sleep(0.5)
 
 
