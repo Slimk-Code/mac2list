@@ -22,7 +22,6 @@ from core.engine import (
     get_next_pending_step,
     get_step_info,
     run_auto_fetch_step,
-    step_progress as _step_progress,
 )
 from core.fetch import (
     category_status as _category_status,
@@ -55,12 +54,7 @@ def clear_screen():
 
 
 def _cooldown(seconds=3):
-    for i in range(seconds, 0, -1):
-        sys.stdout.write("\r  Continuing in {}s...  ".format(i))
-        sys.stdout.flush()
-        time.sleep(1)
-    sys.stdout.write("\r" + " " * 40 + "\r")
-    sys.stdout.flush()
+    time.sleep(seconds)
 
 
 def progress_bar(current, total, prefix="", width=30):
@@ -104,6 +98,17 @@ def channel_name_clean(name):
     return not channel_name_ok(name)
 
 
+def _save_step_outcome(json_mgr, key, ok, reason=""):
+    """Persist pass or failed plus reason for a hub row status."""
+    meta = json_mgr.data.setdefault("_meta", {})
+    meta[key + "_status"] = "pass" if ok else "failed"
+    if not ok and reason:
+        meta[key + "_reason"] = reason
+    else:
+        meta.pop(key + "_reason", None)
+    json_mgr.save()
+
+
 def fetch_all_live_no_viewer(client, json_mgr):
     """Fetch 1st page of every pending live category first,
     then filter the entire set at once and keep the first 100."""
@@ -114,6 +119,7 @@ def fetch_all_live_no_viewer(client, json_mgr):
     # Phase 1: fetch everything into memory, no filtering yet
     collected = []
     fetched_ids = []
+    first_error = None
     for i, cat in enumerate(pending):
         cid = str(cat.get("id"))
         params = {"type": "itv", "action": "get_ordered_list", "genre": cid, "p": "1", "JsHttpRequest": "1-xml"}
@@ -125,16 +131,21 @@ def fetch_all_live_no_viewer(client, json_mgr):
                 collected.append((cid, js.get("data", [])))
                 fetched_ids.append(cid)
             else:
+                if first_error is None:
+                    first_error = result
                 json_mgr.mark_live_genre_failed(cid)
         else:
+            if first_error is None:
+                first_error = result
             json_mgr.mark_live_genre_failed(cid)
-        line = "  Fetching: [{}/{}] done".format(i + 1, len(pending))
+        line = "  -> Fetching: [{}/{}] done".format(i + 1, len(pending))
         sys.stdout.write(chr(13) + line.ljust(80))
         sys.stdout.flush()
         time.sleep(0.1)
     _clear_batch_counter()
     if not fetched_ids:
-        print("  -> [OK] 0 fetched.")
+        _save_step_outcome(json_mgr, "fetch_live",
+                           False, handshake_reason(first_error) if first_error is not None else "unknown")
         return False
     # Phase 2: filter the entire set at once, keep first 100
     kept = [(cid, it) for cid, items in collected for it in items
@@ -153,7 +164,10 @@ def fetch_all_live_no_viewer(client, json_mgr):
     for cid in fetched_ids:
         subset = by_cat.get(cid, [])
         json_mgr.update_live_channels(cid, subset, len(subset))
-    print("  -> [OK] {} channels kept.".format(len(kept)))
+    if not kept:
+        _save_step_outcome(json_mgr, "fetch_live", False, "empty")
+    else:
+        _save_step_outcome(json_mgr, "fetch_live", True)
     return True
 
 
@@ -176,6 +190,7 @@ def fetch_all_movies_no_viewer(client, json_mgr):
     # Phase 1: fetch everything into memory, no filtering yet
     collected = []
     fetched_ids = []
+    first_error = None
     for i, cat in enumerate(pending):
         cid = str(cat.get("id"))
         params = {"type": "vod", "action": "get_ordered_list", "category": cid, "p": "1",
@@ -188,16 +203,21 @@ def fetch_all_movies_no_viewer(client, json_mgr):
                 collected.append((cid, js.get("data", [])))
                 fetched_ids.append(cid)
             else:
+                if first_error is None:
+                    first_error = result
                 json_mgr.mark_movie_category_failed(cid)
         else:
+            if first_error is None:
+                first_error = result
             json_mgr.mark_movie_category_failed(cid)
-        line = "  Fetching: [{}/{}] done".format(i + 1, len(pending))
+        line = "  -> Fetching: [{}/{}] done".format(i + 1, len(pending))
         sys.stdout.write(chr(13) + line.ljust(80))
         sys.stdout.flush()
         time.sleep(0.1)
     _clear_batch_counter()
     if not fetched_ids:
-        print("  -> [OK] 0 fetched.")
+        _save_step_outcome(json_mgr, "fetch_movies",
+                           False, handshake_reason(first_error) if first_error is not None else "unknown")
         return False
     # Phase 2: filter the entire set at once, keep first 100
     kept = [(cid, it) for cid, items in collected for it in items
@@ -216,7 +236,10 @@ def fetch_all_movies_no_viewer(client, json_mgr):
     for cid in fetched_ids:
         subset = by_cat.get(cid, [])
         json_mgr.update_movie_items(cid, subset, len(subset))
-    print("  -> [OK] {} movies kept.".format(len(kept)))
+    if not kept:
+        _save_step_outcome(json_mgr, "fetch_movies", False, "empty")
+    else:
+        _save_step_outcome(json_mgr, "fetch_movies", True)
     return True
 
 
@@ -251,14 +274,20 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
     print()
     total = len(pending)
     fail_count = 0
+    nocmd_count = 0
     for i, item in enumerate(pending):
-        if action_type == "itv":
+        if not item.get("cmd"):
+            nocmd_count += 1
+            fail_count += 1
+        elif action_type == "itv":
             resolved_url, raw = resolve_live(client, json_mgr, item)
             existing_responses.append({
                 "id": item.get("id", ""),
                 "name": item.get("name", item.get("title", "")),
                 "raw_response": raw if raw else item.get("cmd", "")
             })
+            if not resolved_url:
+                fail_count += 1
         else:
             resolved_url, raw = resolve_vod(client, json_mgr, item)
             if resolved_url:
@@ -269,18 +298,13 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
                 })
             else:
                 fail_count += 1
-        line = "  Resolving: [{}/{}]".format(i + 1, total)
+        line = "  -> Resolving: [{}/{}]".format(i + 1, total)
         if fail_count:
             line += "  |  {} failed".format(fail_count)
         sys.stdout.write(chr(13) + line.ljust(80))
         sys.stdout.flush()
         time.sleep(0.3)
     _clear_batch_counter()
-    done = total - fail_count
-    if fail_count:
-        print("  -> [OK] Resolved {}/{} items. {} failed.".format(done, total, fail_count))
-    else:
-        print("  -> [OK] Resolved {}/{} items.".format(done, total))
     if cache:
         step_path = cache.step_path(step_code)
         if step_path:
@@ -301,7 +325,16 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
     os.makedirs(out_dir, exist_ok=True)
     dst = os.path.join(out_dir, os.path.basename(src))
     shutil.move(src, dst)
-    print("  -> [OK] M3U saved to {}".format(dst))
+    rkey = "resolve_live" if section == "live" else "resolve_movies"
+    dead = fail_count - nocmd_count
+    if total == 0:
+        _save_step_outcome(json_mgr, rkey, True)
+    elif dead > 0:
+        _save_step_outcome(json_mgr, rkey, False, "{} dead".format(dead))
+    elif nocmd_count > 0:
+        _save_step_outcome(json_mgr, rkey, False, "no cmd")
+    else:
+        _save_step_outcome(json_mgr, rkey, True)
     return True
 
 
@@ -332,9 +365,9 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
 
         print()
         if max_page > 0:
-            print("  [Enter] Next page  |  [1-{}] Restore  |  [B] Back".format(total))
+            print("  [Enter] Next page  |  [1-{}] Scan  |  [B] Back".format(total))
         else:
-            print("  [1-{}] Restore  |  [B] Back".format(total))
+            print("  [1-{}] Scan  |  [B] Back".format(total))
 
         choice = input("  > ").strip().upper()
         if choice == "B":
@@ -347,21 +380,57 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
                 return items[num - 1]
 
 
-def _portal_status(session):
-    """Pass, failed - xxx, or pending read from the saved session file."""
+def _session_meta(session):
+    """Saved session meta dict for a portal entry, {} when missing."""
     try:
         session_id = make_session_id(session.get("portal", ""), session.get("mac", ""))
         path = os.path.join(SESSION_DIR, session_id + ".json")
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        meta = data.get("_meta", {}) if isinstance(data, dict) else {}
-        if meta.get("handshake_status") == "pass":
-            return "pass"
-        if meta.get("handshake_status") == "failed":
-            return "failed - {}".format(meta.get("handshake_reason", "unknown"))
+        if isinstance(data, dict):
+            meta = data.get("_meta", {})
+            if isinstance(meta, dict):
+                return meta
     except Exception:
         pass
+    return {}
+
+
+def _portal_status(session):
+    """Pass, Step - xxx, or pending read from the saved session file."""
+    meta = _session_meta(session)
+    if meta.get("handshake_status") == "failed":
+        return "Handshake - {}".format(meta.get("handshake_reason", "unknown"))
+    done = meta.get("done_steps", [])
+    scrape_ok = (meta.get("scrape_status") == "pass"
+                 and "C2" in done and "D1" in done)
+    if meta.get("scrape_status") == "failed":
+        return "Scrape - {}".format(meta.get("scrape_reason", "unknown"))
+    if meta.get("handshake_status") == "pass" and scrape_ok:
+        return "pass"
     return "pending"
+
+
+def _portal_rank(session):
+    """Sort key: pending first, then least progress, fully passed last."""
+    meta = _session_meta(session)
+    done = meta.get("done_steps", [])
+    stages = [
+        meta.get("handshake_status") == "pass",
+        meta.get("scrape_status") == "pass" and "C2" in done and "D1" in done,
+        meta.get("fetch_live_status") == "pass",
+        meta.get("fetch_movies_status") == "pass",
+        meta.get("resolve_live_status") == "pass",
+        meta.get("resolve_movies_status") == "pass",
+    ]
+    ran = [meta.get("handshake_status"), meta.get("scrape_status"),
+           meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
+           meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
+    if not any(r in ("pass", "failed") for r in ran):
+        return (0, 0, 0)
+    passed = sum(1 for s in stages if s)
+    first_bad = next((i for i, s in enumerate(stages) if not s), len(stages))
+    return (1, passed, first_bad)
 
 
 def _select_restore_session(sessions):
@@ -378,7 +447,8 @@ def _select_restore_session(sessions):
         mac = str(s.get("mac", ""))[:19]
         return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, _portal_status(s))
 
-    return _select_paginated(sessions, "Restore Session", header_line, row_fmt)
+    sessions = sorted(sessions, key=_portal_rank)
+    return _select_paginated(sessions, "mac2list Scanner v1.2", header_line, row_fmt)
 
 
 def run_resume_or_new():
@@ -390,7 +460,7 @@ def run_resume_or_new():
         if not sessions:
             clear_screen()
             print("=" * 60)
-            print("   Restore Session")
+            print("   mac2list Scanner v1.2")
             print("=" * 60)
             print()
             print("  No saved sessions.")
@@ -417,31 +487,72 @@ def run_resume_or_new():
 # ============================================================
 # PAGE 2 — MAIN HUB
 # ============================================================
-# Next hub draw prints this under the menu, then clears it.
-_hub_notice = []
-
 # Sequential hub order: one step per Enter press.
 _ORDER = ["A1", "SCRAPE", "C5", "C4", "D4", "D3"]
 _hub_pos = 0
 
 
 def run_hub_handshake(client, json_mgr):
-    """Clear, run handshake, then redraw menu with message under it."""
-    global _hub_notice
+    """Fixed rhythm: Executing, running, pause, result, pause."""
     _, _, desc, _, _ = get_step_info("A1")
     print()
     print("  Executing: A1 — {}".format(desc))
     print()
-    print("  -> Handshake running...")
     success, _ = run_handshake_step(client, json_mgr)
+    time.sleep(3)
+    print()
     if success:
         json_mgr.mark_done("A1")
-        result_line = "  -> pass"
+        print("  -> Handshake passed")
     else:
         reason = json_mgr.data.get("_meta", {}).get("handshake_reason", "unknown")
-        result_line = "  -> failed - {}".format(reason)
-    _hub_notice = [result_line, "  -> saved"]
+        print("  -> failed - {}".format(reason))
+    print("  -> session saved")
+    time.sleep(3)
     return success
+
+
+_ROW_KEYS = {"C5": "fetch_live", "C4": "resolve_live",
+             "D4": "fetch_movies", "D3": "resolve_movies"}
+
+
+def _row_counts(json_mgr, code):
+    """(done, total) numbers for a fetch/resolve hub row."""
+    if code == "C5":
+        cats = json_mgr.data["live"].get("categories", [])
+        total = len([c for c in cats if str(c.get("id")) != "*"])
+        return len(json_mgr.get_live_fetched()), total
+    if code == "D4":
+        cats = json_mgr.data["movies"].get("categories", [])
+        total = len([c for c in cats if str(c.get("id")) != "*"])
+        return len(json_mgr.get_movie_fetched()), total
+    if code == "C4":
+        cats = json_mgr.data["live"].get("categories", [])
+        total = sum(1 for c in cats for _ in c.get("channels", []))
+        done = sum(1 for c in cats for ch in c.get("channels", []) if ch.get("resolved_url"))
+        return done, total
+    if code == "D3":
+        cats = json_mgr.data["movies"].get("categories", [])
+        total = sum(1 for c in cats for _ in c.get("items", []))
+        done = sum(1 for c in cats for m in c.get("items", []) if m.get("resolved_url"))
+        return done, total
+    return 0, 0
+
+
+def _row_status(json_mgr, code):
+    """pass, failed - xxx, or pending from the saved step outcome."""
+    meta = json_mgr.data.get("_meta", {})
+    key = _ROW_KEYS.get(code, "")
+    if meta.get(key + "_status") == "pass":
+        return "pass"
+    if meta.get(key + "_status") == "failed":
+        return "failed - {}".format(meta.get(key + "_reason", "unknown"))
+    return "pending"
+
+
+def _row_label(name, json_mgr, code):
+    done, total = _row_counts(json_mgr, code)
+    return "{} ({}/{})".format(name, done, total)
 
 
 def show_hub_header(json_mgr):
@@ -454,28 +565,26 @@ def show_hub_header(json_mgr):
     print("=" * 60)
     print()
 
-    # Scrape categories status: pass, failed - xxx, or previous counts
+    # Scrape categories status: pass, failed - xxx, or Not scraped
     cat_codes = ["C2", "D1"]
     cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
     scrape_meta = json_mgr.data.get("_meta", {})
-    if scrape_meta.get("scrape_status") == "pass" and cat_done == len(cat_codes):
+    if cat_done == len(cat_codes) and scrape_meta.get("scrape_status") == "pass":
         cat_status = "pass"
-    elif scrape_meta.get("scrape_status") == "failed":
-        cat_status = "failed - {}".format(scrape_meta.get("scrape_reason", "unknown"))
-    elif cat_done == 0:
+    elif "scrape_status" not in scrape_meta:
         cat_status = "Not scraped"
     else:
-        cat_status = "{}/{} scraped".format(cat_done, len(cat_codes))
+        cat_status = "failed - {}".format(scrape_meta.get("scrape_reason", "unknown"))
 
     print("  {} {:<45} {}".format(">>" if _hub_pos == 0 else "  ", "handshake", handshake_status(json_mgr)))
     print()
-    print("  {} {:<45} —  {}".format(">>" if _hub_pos == 1 else "  ", "Categories Scraper", cat_status))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 1 else "  ", "Categories Scraper", cat_status))
     print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", "Channels Scraper", _step_progress(json_mgr, "C5")))
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", "Channels Resolver", _step_progress(json_mgr, "C4")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", _row_label("Channels Scraper", json_mgr, "C5"), _row_status(json_mgr, "C5")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", _row_label("Channels Resolver", json_mgr, "C4"), _row_status(json_mgr, "C4")))
     print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 4 else "  ", "Vod Scraper", _step_progress(json_mgr, "D4")))
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", "Vod Resolver", _step_progress(json_mgr, "D3")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 4 else "  ", _row_label("Vod Scraper", json_mgr, "D4"), _row_status(json_mgr, "D4")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", _row_label("Vod Resolver", json_mgr, "D3"), _row_status(json_mgr, "D3")))
     print()
     print("-" * 60)
     print("  [Enter] Next step | [B] Back")
@@ -483,22 +592,14 @@ def show_hub_header(json_mgr):
 
 def show_hub(json_mgr):
     """Display Main Hub. Returns user choice string."""
-    global _hub_notice
     show_hub_header(json_mgr)
     print()
-    choice = input("  > ").strip().upper()
-    if _hub_notice:
-        for line in _hub_notice:
-            print(line)
-        _hub_notice = []
-        time.sleep(3)
-    return choice
+    return input("  > ").strip().upper()
 
 
 def hub_loop(client, json_mgr, is_restored):
     """Main Hub loop: one step per Enter press, in row order."""
-    global _hub_notice, _hub_pos
-    _hub_notice = []
+    global _hub_pos
     _hub_pos = 0
     while True:
         choice = show_hub(json_mgr)
@@ -522,6 +623,9 @@ def hub_loop(client, json_mgr, is_restored):
                     next_code = get_next_pending_step(json_mgr, cat_codes)
                     if next_code is None:
                         break
+                    show_hub_header(json_mgr)
+                    print()
+                    print("  > ")
                     idx, _, desc, info, is_auto = get_step_info(next_code)
                     if not run_single_step(client, json_mgr, next_code, desc, info, is_auto):
                         ok = False
@@ -535,8 +639,11 @@ def hub_loop(client, json_mgr, is_restored):
                 idx, _, desc, info, is_auto = get_step_info(code)
                 ok = run_single_step(client, json_mgr, code, desc, info, is_auto)
             if not ok:
+                time.sleep(3)
                 break
             _hub_pos = (_hub_pos + 1) % len(_ORDER)
+            if _hub_pos == 0:
+                break
 
 
 # ============================================================
@@ -644,27 +751,36 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
             success = resolve_all_no_viewer(client, json_mgr, "C4", "live", "channels", "itv", "live")
         else:
             success = resolve_all_no_viewer(client, json_mgr, "D3", "movies", "items", "vod", "vod")
-    elif code == "A1":
-        success, step_msg = run_handshake_step(client, json_mgr)
     elif code in ("C5", "D4"):
         if code == "C5":
             success = fetch_all_live_no_viewer(client, json_mgr)
         elif code == "D4":
             success = fetch_all_movies_no_viewer(client, json_mgr)
 
+    time.sleep(3)
+    print()
+    pass_text = {
+        "C2": "Categories scraper passed",
+        "D1": "Categories scraper passed",
+        "C5": "Channels scraper passed",
+        "C4": "Channels resolver passed",
+        "D4": "Vod scraper passed",
+        "D3": "Vod resolver passed",
+    }
     if success:
         json_mgr.mark_done(code)
-        if step_msg:
-            print(step_msg)
-        print("  -> [OK] {} complete.".format(desc))
+        print("  -> {}".format(pass_text.get(code, "passed")))
     else:
-        if step_msg:
-            print(step_msg)
-        print("  -> [..] {} — not complete yet.".format(desc))
-
-    if success or step_msg:
-        print()
-        _cooldown()
+        reason = ""
+        if code in ("C2", "D1"):
+            reason = json_mgr.data.get("_meta", {}).get("scrape_reason", "")
+        if reason:
+            print("  -> failed - {}".format(reason))
+        else:
+            print("  -> failed")
+    print("  -> session saved")
+    print()
+    _cooldown()
     return success
 
 
