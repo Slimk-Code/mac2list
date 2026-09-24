@@ -14,7 +14,6 @@ import time
 
 from core.config import (
     OUTPUT_DIR,
-    SECTIONS,
     SESSION_DIR,
     STEP_PARAMS,
 )
@@ -46,7 +45,6 @@ from core.storage import (
 )
 from core.utils import (
     domain_of as _domain_of,
-    time_ago as _time_ago,
 )
 
 # ============================================================
@@ -56,7 +54,7 @@ def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def _cooldown(seconds=1):
+def _cooldown(seconds=3):
     for i in range(seconds, 0, -1):
         sys.stdout.write("\r  Continuing in {}s...  ".format(i))
         sys.stdout.flush()
@@ -112,7 +110,6 @@ def fetch_all_live_no_viewer(client, json_mgr):
     _, pending, _, _ = _category_status(json_mgr, "live")
     if not pending:
         return True
-    show_hub_header(json_mgr)
     print()
     # Phase 1: fetch everything into memory, no filtering yet
     collected = []
@@ -175,7 +172,6 @@ def fetch_all_movies_no_viewer(client, json_mgr):
     _, pending, _, _ = _category_status(json_mgr, "movies")
     if not pending:
         return True
-    show_hub_header(json_mgr)
     print()
     # Phase 1: fetch everything into memory, no filtering yet
     collected = []
@@ -252,7 +248,6 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
                 pass
 
     pending = [it for it in items if not it.get("resolved_url")]
-    show_hub_header(json_mgr)
     print()
     total = len(pending)
     fail_count = 0
@@ -426,13 +421,17 @@ def run_resume_or_new():
 _hub_notice = []
 
 # Sequential hub order: one step per Enter press.
-_ORDER = ["A1", "SCRAPE", "C5", "C4", "D4", "D3", "G1"]
+_ORDER = ["A1", "SCRAPE", "C5", "C4", "D4", "D3"]
 _hub_pos = 0
 
 
 def run_hub_handshake(client, json_mgr):
     """Clear, run handshake, then redraw menu with message under it."""
     global _hub_notice
+    _, _, desc, _, _ = get_step_info("A1")
+    print()
+    print("  Executing: A1 — {}".format(desc))
+    print()
     print("  -> Handshake running...")
     success, _ = run_handshake_step(client, json_mgr)
     if success:
@@ -455,58 +454,51 @@ def show_hub_header(json_mgr):
     print("=" * 60)
     print()
 
-    # Scrape categories status
+    # Scrape categories status: pass, failed - xxx, or previous counts
     cat_codes = ["C2", "D1"]
     cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
-    if cat_done == 0:
+    scrape_meta = json_mgr.data.get("_meta", {})
+    if scrape_meta.get("scrape_status") == "pass" and cat_done == len(cat_codes):
+        cat_status = "pass"
+    elif scrape_meta.get("scrape_status") == "failed":
+        cat_status = "failed - {}".format(scrape_meta.get("scrape_reason", "unknown"))
+    elif cat_done == 0:
         cat_status = "Not scraped"
-    elif cat_done < len(cat_codes):
-        cat_status = "{}/{} scraped".format(cat_done, len(cat_codes))
     else:
-        cat_status = "Updated " + _time_ago(json_mgr.data["_meta"].get("scraped_at", ""))
+        cat_status = "{}/{} scraped".format(cat_done, len(cat_codes))
 
-    # Convert
-    convert_status = "Exported" if json_mgr.is_done("G1") else "Ready"
-
-    # Step rows moved from sub-menus (descs match old submenu rows)
-    _descs = {}
-    for _sec in SECTIONS.values():
-        for _code, _desc, _info, _auto in _sec["items"]:
-            _descs[_code] = _desc
-
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 0 else "  ", _descs.get("A1", "A1"), handshake_status(json_mgr)))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 0 else "  ", "handshake", handshake_status(json_mgr)))
     print()
-    print("  {} {:<45} —  {}".format(">>" if _hub_pos == 1 else "  ", "Scrape Categories", cat_status))
+    print("  {} {:<45} —  {}".format(">>" if _hub_pos == 1 else "  ", "Categories Scraper", cat_status))
     print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", _descs.get("C5", "C5"), _step_progress(json_mgr, "C5")))
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", _descs.get("C4", "C4"), _step_progress(json_mgr, "C4")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", "Channels Scraper", _step_progress(json_mgr, "C5")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", "Channels Resolver", _step_progress(json_mgr, "C4")))
     print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 4 else "  ", _descs.get("D4", "D4"), _step_progress(json_mgr, "D4")))
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", _descs.get("D3", "D3"), _step_progress(json_mgr, "D3")))
-    print()
-    print("  {} {:<45} —  {}".format(">>" if _hub_pos == 6 else "  ", "Convert", convert_status))
-    print()
-    print("  [Enter] Next step | [B] Back")
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 4 else "  ", "Vod Scraper", _step_progress(json_mgr, "D4")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", "Vod Resolver", _step_progress(json_mgr, "D3")))
     print()
     print("-" * 60)
+    print("  [Enter] Next step | [B] Back")
 
 
 def show_hub(json_mgr):
     """Display Main Hub. Returns user choice string."""
     global _hub_notice
     show_hub_header(json_mgr)
+    print()
+    choice = input("  > ").strip().upper()
     if _hub_notice:
         for line in _hub_notice:
             print(line)
         _hub_notice = []
-    print()
-    return input("  > ").strip().upper()
+        time.sleep(3)
+    return choice
 
 
 def hub_loop(client, json_mgr, is_restored):
     """Main Hub loop: one step per Enter press, in row order."""
     global _hub_notice, _hub_pos
-    _hub_notice = ["  -> press Enter to start with handshake"]
+    _hub_notice = []
     _hub_pos = 0
     while True:
         choice = show_hub(json_mgr)
@@ -530,50 +522,21 @@ def hub_loop(client, json_mgr, is_restored):
                     next_code = get_next_pending_step(json_mgr, cat_codes)
                     if next_code is None:
                         break
-                    show_hub_header(json_mgr)
                     idx, _, desc, info, is_auto = get_step_info(next_code)
                     if not run_single_step(client, json_mgr, next_code, desc, info, is_auto):
                         ok = False
                         break
-            elif code == "G1":
-                run_convert_submenu(json_mgr)
+                if ok:
+                    meta = json_mgr.data.setdefault("_meta", {})
+                    meta["scrape_status"] = "pass"
+                    meta.pop("scrape_reason", None)
+                    json_mgr.save()
             else:
                 idx, _, desc, info, is_auto = get_step_info(code)
                 ok = run_single_step(client, json_mgr, code, desc, info, is_auto)
             if not ok:
                 break
             _hub_pos = (_hub_pos + 1) % len(_ORDER)
-        else:
-            print("  Press Enter for next step or [B] Back.")
-            time.sleep(0.5)
-
-
-# ============================================================
-# PAGE 3 — CONVERT
-# ============================================================
-def run_convert_submenu(json_mgr):
-    """Convert action."""
-    clear_screen()
-    print("=" * 60)
-    print("   Convert")
-    print("=" * 60)
-    print()
-
-    files = generate_m3u(json_mgr)
-    json_mgr.mark_done("G1")
-
-    print("  -> [OK] M3U files generated:")
-    print("     Live:   {}".format(files.get("live", "")))
-    print("     Movies: {}".format(files.get("movies", "")))
-    print()
-    print("  [R] Regenerate  |  [B] Back")
-    choice = input("  > ").strip().upper()
-    if choice == "R":
-        files = generate_m3u(json_mgr)
-        print("  -> [OK] Regenerated:")
-        print("     Live:   {}".format(files.get("live", "")))
-        print("     Movies: {}".format(files.get("movies", "")))
-        _cooldown()
 
 
 # ============================================================
@@ -635,6 +598,10 @@ def run_category_scrape_no_probe(client, json_mgr, code, desc):
     cache = getattr(json_mgr, "cache", None)
     fname, status_str, is_error, is_200 = handle_fetch_result(result, code, safe_name, cache=cache)
     if is_error:
+        meta = json_mgr.data.setdefault("_meta", {})
+        meta["scrape_status"] = "failed"
+        meta["scrape_reason"] = handshake_reason(result)
+        json_mgr.save()
         return False, "  -> [!] Failed — saved error to {}".format(fname)
     msg = "  -> [OK] Saved to {}".format(fname)
     data = result.get("_data")
@@ -684,10 +651,6 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
             success = fetch_all_live_no_viewer(client, json_mgr)
         elif code == "D4":
             success = fetch_all_movies_no_viewer(client, json_mgr)
-    elif code == "G1":
-        files = generate_m3u(json_mgr)
-        step_msg = "  -> [OK] M3U files saved to {}".format(os.path.join(OUTPUT_DIR, json_mgr.cache.session_id))
-        success = True
 
     if success:
         json_mgr.mark_done(code)
