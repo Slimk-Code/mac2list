@@ -8,7 +8,6 @@ screen, menu, progress renderer and the main() entry point.
 """
 import json
 import os
-import shutil
 import sys
 import time
 
@@ -17,7 +16,6 @@ from core.config import (
     SESSION_DIR,
     STEP_PARAMS,
 )
-from core.convert import generate_m3u
 from core.engine import (
     get_next_pending_step,
     get_step_info,
@@ -246,6 +244,43 @@ def fetch_all_movies_no_viewer(client, json_mgr):
 # ============================================================
 # RESOLVE ALL + SAVE M3U (interface only, core untouched)
 # ============================================================
+def save_section_m3u(json_mgr, section, folder):
+    """Write one section m3u straight into its folder. No other files created."""
+    session_id = json_mgr.cache.session_id
+    out_dir = os.path.join(OUTPUT_DIR, session_id, folder)
+    os.makedirs(out_dir, exist_ok=True)
+    lines = ["#EXTM3U"]
+    if section == "live":
+        for cat in json_mgr.data["live"].get("categories", []):
+            group = cat.get("title", "General")
+            for ch in cat.get("channels", []):
+                url = ch.get("resolved_url", "")
+                if not url:
+                    continue
+                name = ch.get("name", "Unknown")
+                logo = ch.get("logo", "")
+                lines.append('#EXTINF:-1 tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}'.format(
+                    ch.get("id", ""), name, logo, group, name))
+                lines.append(url)
+        path = os.path.join(out_dir, "{}_LIVE.m3u".format(session_id))
+    else:
+        for cat in json_mgr.data["movies"].get("categories", []):
+            group = cat.get("title", "Movies")
+            for m in cat.get("items", []):
+                url = m.get("resolved_url", "")
+                if not url:
+                    continue
+                name = m.get("name", "Unknown")
+                logo = m.get("logo", "")
+                lines.append('#EXTINF:-1 tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}'.format(
+                    m.get("id", ""), name, logo, group, name))
+                lines.append(url)
+        path = os.path.join(out_dir, "{}_MOVIE.m3u".format(session_id))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
 def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_type, folder):
     """Resolve every pending item at once, no picker, then save section m3u to its folder."""
     items = []
@@ -318,13 +353,7 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
             with open(step_path, "w", encoding="utf-8") as f:
                 json.dump(step_data, f, indent=2, ensure_ascii=False)
 
-    files = generate_m3u(json_mgr)
-    key = "live" if section == "live" else "movies"
-    src = files.get(key, "")
-    out_dir = os.path.join(OUTPUT_DIR, json_mgr.cache.session_id, folder)
-    os.makedirs(out_dir, exist_ok=True)
-    dst = os.path.join(out_dir, os.path.basename(src))
-    shutil.move(src, dst)
+    save_section_m3u(json_mgr, section, folder)
     rkey = "resolve_live" if section == "live" else "resolve_movies"
     dead = fail_count - nocmd_count
     if total == 0:
@@ -587,7 +616,7 @@ def show_hub_header(json_mgr):
     print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", _row_label("Vod Resolver", json_mgr, "D3"), _row_status(json_mgr, "D3")))
     print()
     print("-" * 60)
-    print("  [Enter] Next step | [B] Back")
+    print("  [Enter] Start | [B] Back")
 
 
 def show_hub(json_mgr):
@@ -598,52 +627,55 @@ def show_hub(json_mgr):
 
 
 def hub_loop(client, json_mgr, is_restored):
-    """Main Hub loop: one step per Enter press, in row order."""
+    """Main Hub loop: one Enter runs the full order automatically."""
     global _hub_pos
     _hub_pos = 0
     while True:
         choice = show_hub(json_mgr)
         if choice == "B":
-            break
-        elif choice == "":
-            code = _ORDER[_hub_pos]
-            ok = True
-            if code == "SCRAPE":
-                cat_codes = ["C2", "D1"]
-                # Always reset so it scrapes again at once
-                for c in cat_codes:
-                    if json_mgr.is_done(c):
-                        done = json_mgr.data["_meta"].get("done_steps", [])
-                        if c in done:
-                            done.remove(c)
-                            json_mgr.data["_meta"]["done_steps"] = done
-                json_mgr.data["_meta"]["scraped_at"] = ""
+            return
+        if choice != "":
+            continue
+        break
+    for pos, code in enumerate(_ORDER):
+        _hub_pos = pos
+        ok = True
+        if code == "SCRAPE":
+            cat_codes = ["C2", "D1"]
+            # Always reset so it scrapes again at once
+            for c in cat_codes:
+                if json_mgr.is_done(c):
+                    done = json_mgr.data["_meta"].get("done_steps", [])
+                    if c in done:
+                        done.remove(c)
+                        json_mgr.data["_meta"]["done_steps"] = done
+            json_mgr.data["_meta"]["scraped_at"] = ""
+            json_mgr.save()
+            while True:
+                next_code = get_next_pending_step(json_mgr, cat_codes)
+                if next_code is None:
+                    break
+                show_hub_header(json_mgr)
+                print()
+                print("  > ")
+                idx, _, desc, info, is_auto = get_step_info(next_code)
+                if not run_single_step(client, json_mgr, next_code, desc, info, is_auto):
+                    ok = False
+                    break
+            if ok:
+                meta = json_mgr.data.setdefault("_meta", {})
+                meta["scrape_status"] = "pass"
+                meta.pop("scrape_reason", None)
                 json_mgr.save()
-                while True:
-                    next_code = get_next_pending_step(json_mgr, cat_codes)
-                    if next_code is None:
-                        break
-                    show_hub_header(json_mgr)
-                    print()
-                    print("  > ")
-                    idx, _, desc, info, is_auto = get_step_info(next_code)
-                    if not run_single_step(client, json_mgr, next_code, desc, info, is_auto):
-                        ok = False
-                        break
-                if ok:
-                    meta = json_mgr.data.setdefault("_meta", {})
-                    meta["scrape_status"] = "pass"
-                    meta.pop("scrape_reason", None)
-                    json_mgr.save()
-            else:
-                idx, _, desc, info, is_auto = get_step_info(code)
-                ok = run_single_step(client, json_mgr, code, desc, info, is_auto)
-            if not ok:
-                time.sleep(3)
-                break
-            _hub_pos = (_hub_pos + 1) % len(_ORDER)
-            if _hub_pos == 0:
-                break
+        else:
+            show_hub_header(json_mgr)
+            print()
+            print("  > ")
+            idx, _, desc, info, is_auto = get_step_info(code)
+            ok = run_single_step(client, json_mgr, code, desc, info, is_auto)
+        if not ok:
+            time.sleep(3)
+            break
 
 
 # ============================================================
