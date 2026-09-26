@@ -17,7 +17,6 @@ from core.config import (
     STEP_PARAMS,
 )
 from core.engine import (
-    get_next_pending_step,
     get_step_info,
     run_auto_fetch_step,
 )
@@ -143,7 +142,7 @@ def fetch_all_live_no_viewer(client, json_mgr):
     _clear_batch_counter()
     if not fetched_ids:
         _save_step_outcome(json_mgr, "fetch_live",
-                           False, handshake_reason(first_error) if first_error is not None else "unknown")
+                           False, fetch_reason(first_error) if first_error is not None else "unknown")
         return False
     # Phase 2: filter the entire set at once, keep first 100
     kept = [(cid, it) for cid, items in collected for it in items
@@ -215,7 +214,7 @@ def fetch_all_movies_no_viewer(client, json_mgr):
     _clear_batch_counter()
     if not fetched_ids:
         _save_step_outcome(json_mgr, "fetch_movies",
-                           False, handshake_reason(first_error) if first_error is not None else "unknown")
+                           False, fetch_reason(first_error) if first_error is not None else "unknown")
         return False
     # Phase 2: filter the entire set at once, keep first 100
     kept = [(cid, it) for cid, items in collected for it in items
@@ -394,19 +393,24 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
 
         print()
         if max_page > 0:
-            print("  [Enter] Next page  |  [1-{}] Scan  |  [B] Back".format(total))
+            print("  [Enter] Next page  |  [1-{}] Single Scan  |  [F] Full Scan  |  [B] Back".format(total))
         else:
-            print("  [1-{}] Scan  |  [B] Back".format(total))
+            print("  [1-{}] Single Scan  |  [F] Full Scan  |  [B] Back".format(total))
 
         choice = input("  > ").strip().upper()
         if choice == "B":
             return None
+        elif choice == "F":
+            return "FULL"
         elif choice == "" and max_page > 0:
             page = (page + 1) % (max_page + 1)
         elif choice.isdigit():
             num = int(choice)
             if 1 <= num <= total:
-                return items[num - 1]
+                picked = items[num - 1]
+                if isinstance(picked, dict) and picked.get("kind") == "pending":
+                    continue
+                return picked
 
 
 def _session_meta(session):
@@ -426,22 +430,35 @@ def _session_meta(session):
 
 
 def _portal_status(session):
-    """Pass, Step - xxx, or pending read from the saved session file."""
+    """Success only when all six steps pass, else first failure or -."""
     meta = _session_meta(session)
-    if meta.get("handshake_status") == "failed":
-        return "Handshake - {}".format(meta.get("handshake_reason", "unknown"))
     done = meta.get("done_steps", [])
-    scrape_ok = (meta.get("scrape_status") == "pass"
-                 and "C2" in done and "D1" in done)
-    if meta.get("scrape_status") == "failed":
-        return "Scrape - {}".format(meta.get("scrape_reason", "unknown"))
-    if meta.get("handshake_status") == "pass" and scrape_ok:
-        return "pass"
-    return "pending"
+    stages = [
+        ("Handshake", "handshake_status",
+         meta.get("handshake_status") == "pass"),
+        ("Scrape", "scrape_status",
+         meta.get("scrape_status") == "pass" and "C2" in done and "D1" in done),
+        ("Ch scrape", "fetch_live_status",
+         meta.get("fetch_live_status") == "pass"),
+        ("Ch resolve", "resolve_live_status",
+         meta.get("resolve_live_status") == "pass"),
+        ("Vod scrape", "fetch_movies_status",
+         meta.get("fetch_movies_status") == "pass"),
+        ("Vod resolve", "resolve_movies_status",
+         meta.get("resolve_movies_status") == "pass"),
+    ]
+    for name, key, passed in stages:
+        if not passed:
+            if meta.get(key) == "failed":
+                return "{} - {}".format(name, meta.get(key[:-7] + "_reason", "unknown"))
+            return "-"
+    return "success"
 
 
 def _portal_rank(session):
-    """Sort key: pending first, then least progress, fully passed last."""
+    """Sort key: pending first, then least progress, fully passed last, locked very last."""
+    if session.get("kind") == "pending":
+        return (1, 0, 0, 0, "")
     meta = _session_meta(session)
     done = meta.get("done_steps", [])
     stages = [
@@ -456,10 +473,16 @@ def _portal_rank(session):
            meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
            meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
     if not any(r in ("pass", "failed") for r in ran):
-        return (0, 0, 0)
+        return (0, 0, 0, 0, "")
     passed = sum(1 for s in stages if s)
     first_bad = next((i for i, s in enumerate(stages) if not s), len(stages))
-    return (1, passed, first_bad)
+    reason_keys = ["handshake_reason", "scrape_reason",
+                   "fetch_live_reason", "fetch_movies_reason",
+                   "resolve_live_reason", "resolve_movies_reason"]
+    reason = ""
+    if first_bad < len(stages):
+        reason = meta.get(reason_keys[first_bad], "") or ""
+    return (0, 1, passed, first_bad, reason)
 
 
 def _select_restore_session(sessions):
@@ -474,15 +497,18 @@ def _select_restore_session(sessions):
     def row_fmt(s, idx):
         portal = _domain_of(s.get("portal", ""))[:24]
         mac = str(s.get("mac", ""))[:19]
-        return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, _portal_status(s))
+        status = "Locked" if s.get("kind") == "pending" else _portal_status(s)
+        return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, status)
 
     sessions = sorted(sessions, key=_portal_rank)
-    return _select_paginated(sessions, "mac2list Scanner v1.2", header_line, row_fmt)
+    picked = _select_paginated(sessions, "mac2list Scanner v1.2", header_line, row_fmt)
+    return picked, sessions
 
 
 def run_resume_or_new():
     """Page 1: Open straight on Restore Session viewer.
-    Returns (portal, mac, json_mgr, is_restored)."""
+    Returns (mode, payload). ONE: (portal, mac, idx, total).
+    FULL: sorted sessions list. EMPTY: None."""
     while True:
         sessions = _database_sessions()
         _cleanup_orphans(sessions)
@@ -494,23 +520,17 @@ def run_resume_or_new():
             print()
             print("  No saved sessions.")
             _cooldown()
-            return None, None, None, False
+            return "EMPTY", None
 
-        session = _select_restore_session(sessions)
-        if session is None:
+        picked, sessions = _select_restore_session(sessions)
+        if picked is None:
             print("  Quitting...")
             sys.exit(0)
+        if picked == "FULL":
+            return "FULL", sessions
 
-        portal = session["portal"]
-        mac = session["mac"]
-        json_mgr = JSONManager(portal, mac)
-        meta = json_mgr.data.setdefault("_meta", {})
-        if not meta.get("portal") or not meta.get("mac"):
-            json_mgr.set_meta(portal, mac)
-        is_restored = True
-        break
-
-    return portal, mac, json_mgr, is_restored
+        idx = sessions.index(picked) + 1
+        return "ONE", (picked["portal"], picked["mac"], idx, len(sessions))
 
 
 # ============================================================
@@ -532,7 +552,7 @@ def run_hub_handshake(client, json_mgr):
     print()
     if success:
         json_mgr.mark_done("A1")
-        print("  -> Handshake passed")
+        print("  -> Handshake success")
     else:
         reason = json_mgr.data.get("_meta", {}).get("handshake_reason", "unknown")
         print("  -> failed - {}".format(reason))
@@ -569,14 +589,14 @@ def _row_counts(json_mgr, code):
 
 
 def _row_status(json_mgr, code):
-    """pass, failed - xxx, or pending from the saved step outcome."""
+    """success, failed - xxx, or - from the saved step outcome."""
     meta = json_mgr.data.get("_meta", {})
     key = _ROW_KEYS.get(code, "")
     if meta.get(key + "_status") == "pass":
-        return "pass"
+        return "success"
     if meta.get(key + "_status") == "failed":
         return "failed - {}".format(meta.get(key + "_reason", "unknown"))
-    return "pending"
+    return "-"
 
 
 def _row_label(name, json_mgr, code):
@@ -594,14 +614,14 @@ def show_hub_header(json_mgr):
     print("=" * 60)
     print()
 
-    # Scrape categories status: pass, failed - xxx, or Not scraped
+    # Scrape categories status: success, failed - xxx, or -
     cat_codes = ["C2", "D1"]
     cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
     scrape_meta = json_mgr.data.get("_meta", {})
     if cat_done == len(cat_codes) and scrape_meta.get("scrape_status") == "pass":
-        cat_status = "pass"
+        cat_status = "success"
     elif "scrape_status" not in scrape_meta:
-        cat_status = "Not scraped"
+        cat_status = "-"
     else:
         cat_status = "failed - {}".format(scrape_meta.get("scrape_reason", "unknown"))
 
@@ -616,7 +636,10 @@ def show_hub_header(json_mgr):
     print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", _row_label("Vod Resolver", json_mgr, "D3"), _row_status(json_mgr, "D3")))
     print()
     print("-" * 60)
-    print("  [Enter] Start | [B] Back")
+    if _hub_full:
+        print("  {} out of {}".format(_hub_title_idx, _hub_title_total))
+    else:
+        print("  [Enter] Start | [B] Back")
 
 
 def show_hub(json_mgr):
@@ -628,15 +651,16 @@ def show_hub(json_mgr):
 
 def hub_loop(client, json_mgr, is_restored):
     """Main Hub loop: one Enter runs the full order automatically."""
-    global _hub_pos
+    global _hub_pos, _scrape_fail_reason
     _hub_pos = 0
-    while True:
-        choice = show_hub(json_mgr)
-        if choice == "B":
-            return
-        if choice != "":
-            continue
-        break
+    if not _hub_full:
+        while True:
+            choice = show_hub(json_mgr)
+            if choice == "B":
+                return
+            if choice != "":
+                continue
+            break
     for pos, code in enumerate(_ORDER):
         _hub_pos = pos
         ok = True
@@ -651,22 +675,27 @@ def hub_loop(client, json_mgr, is_restored):
                         json_mgr.data["_meta"]["done_steps"] = done
             json_mgr.data["_meta"]["scraped_at"] = ""
             json_mgr.save()
-            while True:
-                next_code = get_next_pending_step(json_mgr, cat_codes)
-                if next_code is None:
-                    break
+            _scrape_fail_reason = ""
+            for next_code in cat_codes:
                 show_hub_header(json_mgr)
                 print()
                 print("  > ")
                 idx, _, desc, info, is_auto = get_step_info(next_code)
-                if not run_single_step(client, json_mgr, next_code, desc, info, is_auto):
-                    ok = False
-                    break
-            if ok:
-                meta = json_mgr.data.setdefault("_meta", {})
+                run_single_step(client, json_mgr, next_code, desc, info, is_auto)
+            meta = json_mgr.data.setdefault("_meta", {})
+            if _scrape_fail_reason:
+                ok = False
+                meta["scrape_status"] = "failed"
+                meta["scrape_reason"] = _scrape_fail_reason
+            elif (len(json_mgr.data.get("live", {}).get("categories", [])) == 0
+                    and len(json_mgr.data.get("movies", {}).get("categories", [])) == 0):
+                ok = False
+                meta["scrape_status"] = "failed"
+                meta["scrape_reason"] = "no category"
+            else:
                 meta["scrape_status"] = "pass"
                 meta.pop("scrape_reason", None)
-                json_mgr.save()
+            json_mgr.save()
         else:
             show_hub_header(json_mgr)
             print()
@@ -694,15 +723,28 @@ def handshake_reason(result):
     return "no token"
 
 
+def fetch_reason(result):
+    """Short failure word for a category fetch result."""
+    err = str(result.get("_error") or "").lower()
+    if "timeout" in err or "timed out" in err:
+        return "timeout"
+    if not result.get("_data"):
+        status = result.get("_status")
+        if status is None:
+            return "connection"
+        return "HTTP {}".format(status)
+    return "bad data"
+
+
 def handshake_status(json_mgr):
-    """Hub row status: pass, failed - xxx, or pending when never run."""
+    """Hub row status: success, failed - xxx, or - when never run."""
     meta = json_mgr.data.get("_meta", {})
     outcome = meta.get("handshake_status", "")
     if outcome == "pass":
-        return "pass"
+        return "success"
     if outcome == "failed":
         return "failed - {}".format(meta.get("handshake_reason", "unknown"))
-    return "pending"
+    return "-"
 
 
 def run_handshake_step(client, json_mgr):
@@ -727,8 +769,14 @@ def run_handshake_step(client, json_mgr):
 # ============================================================
 # CATEGORY SCRAPE WITHOUT FIRST PAGE (interface only)
 # ============================================================
+# Transient scrape failure reason for the current click.
+# Persisted once, after both C2 and D1 finish.
+_scrape_fail_reason = ""
+
+
 def run_category_scrape_no_probe(client, json_mgr, code, desc):
     """Fetch category list only, no per-category first-page check."""
+    global _scrape_fail_reason
     params = STEP_PARAMS.get(code)
     if not params:
         return False, ""
@@ -737,10 +785,7 @@ def run_category_scrape_no_probe(client, json_mgr, code, desc):
     cache = getattr(json_mgr, "cache", None)
     fname, status_str, is_error, is_200 = handle_fetch_result(result, code, safe_name, cache=cache)
     if is_error:
-        meta = json_mgr.data.setdefault("_meta", {})
-        meta["scrape_status"] = "failed"
-        meta["scrape_reason"] = handshake_reason(result)
-        json_mgr.save()
+        _scrape_fail_reason = handshake_reason(result)
         return False, "  -> [!] Failed — saved error to {}".format(fname)
     msg = "  -> [OK] Saved to {}".format(fname)
     data = result.get("_data")
@@ -792,20 +837,20 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
     time.sleep(3)
     print()
     pass_text = {
-        "C2": "Categories scraper passed",
-        "D1": "Categories scraper passed",
-        "C5": "Channels scraper passed",
-        "C4": "Channels resolver passed",
-        "D4": "Vod scraper passed",
-        "D3": "Vod resolver passed",
+        "C2": "Categories scraper success",
+        "D1": "Categories scraper success",
+        "C5": "Channels scraper success",
+        "C4": "Channels resolver success",
+        "D4": "Vod scraper success",
+        "D3": "Vod resolver success",
     }
     if success:
         json_mgr.mark_done(code)
-        print("  -> {}".format(pass_text.get(code, "passed")))
+        print("  -> {}".format(pass_text.get(code, "success")))
     else:
         reason = ""
         if code in ("C2", "D1"):
-            reason = json_mgr.data.get("_meta", {}).get("scrape_reason", "")
+            reason = _scrape_fail_reason or json_mgr.data.get("_meta", {}).get("scrape_reason", "")
         if reason:
             print("  -> failed - {}".format(reason))
         else:
@@ -819,19 +864,86 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
 # ============================================================
 # MAIN
 # ============================================================
-def main():
-    while True:
-        portal, mac, json_mgr, is_restored = run_resume_or_new()
+# Position info traveling with the portal into the hub title.
+_hub_title_idx = 0
+_hub_title_total = 0
 
-        if not portal or not mac or not json_mgr:
+# Full Scan mode: counter row on, start prompt off.
+_hub_full = False
+
+
+def _run_one(portal, mac, idx, total):
+    """Open one portal and run its hub. Fail and done both return here."""
+    global _hub_title_idx, _hub_title_total
+    json_mgr = JSONManager(portal, mac)
+    meta = json_mgr.data.setdefault("_meta", {})
+    if not meta.get("portal") or not meta.get("mac"):
+        json_mgr.set_meta(portal, mac)
+    # Clean open: drop step state from memory only (no save), so the hub
+    # starts pending while the file keeps history for the portal list.
+    # The run re-saves fresh outcomes, content and markers as it goes.
+    meta.pop("done_steps", None)
+    meta.pop("last_step", None)
+    meta.pop("ignored_steps", None)
+    meta.pop("scraped_at", None)
+    for key in ("handshake_status", "handshake_reason",
+                "scrape_status", "scrape_reason",
+                "fetch_live_status", "fetch_live_reason",
+                "fetch_movies_status", "fetch_movies_reason",
+                "resolve_live_status", "resolve_live_reason",
+                "resolve_movies_status", "resolve_movies_reason"):
+        meta.pop(key, None)
+    for section in ("live", "movies"):
+        sec = json_mgr.data.get(section)
+        if isinstance(sec, dict):
+            sec["categories"] = []
+            for key in [k for k in sec
+                        if k.startswith(("_remaining", "_fetched", "_failed", "_probed"))]:
+                sec[key] = []
+    _hub_title_idx = idx
+    _hub_title_total = total
+    client = Mac2ListPortal(portal, mac)
+
+    # No handshake here — first screen just moves to the hub.
+    # Handshake runs only on hub row [1] click.
+    # Enter Hub (returns on [B] Back → session selection)
+    hub_loop(client, json_mgr, True)
+
+
+def _scan_again(session):
+    """Second-plus runs: never-scanned, handshake-timeout or scrape-timeout only."""
+    meta = _session_meta(session)
+    ran = [meta.get("handshake_status"), meta.get("scrape_status"),
+           meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
+           meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
+    if not any(r in ("pass", "failed") for r in ran):
+        return True
+    if (meta.get("handshake_status") == "failed"
+            and meta.get("handshake_reason") == "timeout"):
+        return True
+    return (meta.get("scrape_status") == "failed"
+            and meta.get("scrape_reason") == "timeout")
+
+
+def main():
+    global _hub_full
+    while True:
+        mode, payload = run_resume_or_new()
+
+        if mode == "EMPTY":
             return
 
-        client = Mac2ListPortal(portal, mac)
-
-        # No handshake here — first screen just moves to the hub.
-        # Handshake runs only on hub row [1] click.
-        # Enter Hub (returns on [B] Back → session selection)
-        hub_loop(client, json_mgr, is_restored)
+        if mode == "FULL":
+            todo = [s for s in payload
+                    if s.get("kind") != "pending" and _scan_again(s)]
+            for i, session in enumerate(todo):
+                _hub_full = True
+                _run_one(session["portal"], session["mac"], i + 1, len(todo))
+            _hub_full = False
+        else:
+            _hub_full = False
+            portal, mac, idx, total = payload
+            _run_one(portal, mac, idx, total)
 
 
 if __name__ == "__main__":
