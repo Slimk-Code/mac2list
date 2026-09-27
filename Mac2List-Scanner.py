@@ -99,7 +99,7 @@ def _save_step_outcome(json_mgr, key, ok, reason=""):
     """Persist pass or failed plus reason for a hub row status."""
     meta = json_mgr.data.setdefault("_meta", {})
     meta[key + "_status"] = "pass" if ok else "failed"
-    if not ok and reason:
+    if reason:
         meta[key + "_reason"] = reason
     else:
         meta.pop(key + "_reason", None)
@@ -355,8 +355,11 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
     save_section_m3u(json_mgr, section, folder)
     rkey = "resolve_live" if section == "live" else "resolve_movies"
     dead = fail_count - nocmd_count
+    live = total - fail_count
     if total == 0:
         _save_step_outcome(json_mgr, rkey, True)
+    elif live > 0 and dead > 0:
+        _save_step_outcome(json_mgr, rkey, True, "{}%".format(int(live * 100 / total)))
     elif dead > 0:
         _save_step_outcome(json_mgr, rkey, False, "{} dead".format(dead))
     elif nocmd_count > 0:
@@ -413,46 +416,87 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
                 return picked
 
 
-def _session_meta(session):
-    """Saved session meta dict for a portal entry, {} when missing."""
+def _session_data(session):
+    """Full saved session dict for a portal entry, {} when missing."""
     try:
         session_id = make_session_id(session.get("portal", ""), session.get("mac", ""))
         path = os.path.join(SESSION_DIR, session_id + ".json")
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            meta = data.get("_meta", {})
-            if isinstance(meta, dict):
-                return meta
+            return data
     except Exception:
         pass
     return {}
 
 
+def _session_meta(session):
+    """Saved session meta dict for a portal entry, {} when missing."""
+    meta = _session_data(session).get("_meta", {})
+    return meta if isinstance(meta, dict) else {}
+
+
 def _portal_status(session):
-    """Success only when all six steps pass, else first failure or -."""
-    meta = _session_meta(session)
-    done = meta.get("done_steps", [])
-    stages = [
-        ("Handshake", "handshake_status",
-         meta.get("handshake_status") == "pass"),
-        ("Scrape", "scrape_status",
-         meta.get("scrape_status") == "pass" and "C2" in done and "D1" in done),
-        ("Ch scrape", "fetch_live_status",
-         meta.get("fetch_live_status") == "pass"),
-        ("Ch resolve", "resolve_live_status",
-         meta.get("resolve_live_status") == "pass"),
-        ("Vod scrape", "fetch_movies_status",
-         meta.get("fetch_movies_status") == "pass"),
-        ("Vod resolve", "resolve_movies_status",
-         meta.get("resolve_movies_status") == "pass"),
-    ]
-    for name, key, passed in stages:
-        if not passed:
-            if meta.get(key) == "failed":
-                return "{} - {}".format(name, meta.get(key[:-7] + "_reason", "unknown"))
-            return "-"
-    return "success"
+    """Merged success line when links exist, else combined side causes."""
+    data = _session_data(session)
+    meta = data.get("_meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    if meta.get("handshake_status") == "failed":
+        return "Handshake - {}".format(meta.get("handshake_reason", "unknown"))
+
+    def _pct(section, bucket):
+        sec = data.get(section, {})
+        if not isinstance(sec, dict):
+            return 0, 0
+        items = sec.get("categories", [])
+        if not isinstance(items, list):
+            return 0, 0
+        total = 0
+        done = 0
+        for cat in items:
+            if not isinstance(cat, dict):
+                continue
+            bucket_items = cat.get(bucket, [])
+            if not isinstance(bucket_items, list):
+                continue
+            for it in bucket_items:
+                if not isinstance(it, dict):
+                    continue
+                total += 1
+                if it.get("resolved_url"):
+                    done += 1
+        return done, total
+
+    live_done, live_total = _pct("live", "channels")
+    vod_done, vod_total = _pct("movies", "items")
+    if live_done + vod_done > 0:
+        live_pct = int(live_done * 100 / live_total) if live_total else 0
+        vod_pct = int(vod_done * 100 / vod_total) if vod_total else 0
+        return "success - {}% LIVE / {}% VOD".format(live_pct, vod_pct)
+    if meta.get("scrape_status") == "failed" and meta.get("scrape_reason") == "no category":
+        return "No category"
+
+    def _side_cause(scrape_key, fetch_key, resolve_key):
+        for key in (scrape_key, fetch_key, resolve_key):
+            if meta.get(key + "_status") == "failed":
+                return meta.get(key + "_reason", "unknown") or "unknown"
+        return ""
+
+    live_cause = _side_cause("scrape_live", "fetch_live", "resolve_live")
+    vod_cause = _side_cause("scrape_movies", "fetch_movies", "resolve_movies")
+    if live_cause and vod_cause:
+        return "Live {} / Vod {}".format(live_cause, vod_cause)
+    if live_cause:
+        return "Live {}".format(live_cause)
+    if vod_cause:
+        return "Vod {}".format(vod_cause)
+    ran = [meta.get("handshake_status"), meta.get("scrape_status"),
+           meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
+           meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
+    if any(r in ("pass", "failed") for r in ran):
+        return "No Data"
+    return "-"
 
 
 def _portal_rank(session):
@@ -536,8 +580,8 @@ def run_resume_or_new():
 # ============================================================
 # PAGE 2 — MAIN HUB
 # ============================================================
-# Sequential hub order: one step per Enter press.
-_ORDER = ["A1", "SCRAPE", "C5", "C4", "D4", "D3"]
+# Sequential hub order: one Enter runs the full order automatically.
+_ORDER = ["A1", "LIVE", "VOD"]
 _hub_pos = 0
 
 
@@ -589,19 +633,42 @@ def _row_counts(json_mgr, code):
 
 
 def _row_status(json_mgr, code):
-    """success, failed - xxx, or - from the saved step outcome."""
+    """success plus percent, failed - xxx, or - from the saved step outcome."""
     meta = json_mgr.data.get("_meta", {})
     key = _ROW_KEYS.get(code, "")
     if meta.get(key + "_status") == "pass":
+        reason = meta.get(key + "_reason", "")
+        if reason:
+            return "success - {}".format(reason)
         return "success"
     if meta.get(key + "_status") == "failed":
         return "failed - {}".format(meta.get(key + "_reason", "unknown"))
     return "-"
 
 
-def _row_label(name, json_mgr, code):
-    done, total = _row_counts(json_mgr, code)
-    return "{} ({}/{})".format(name, done, total)
+def _side_status(json_mgr, scrape_key, fetch_code, resolve_code):
+    """success, failed - xxx, or - combined across one side, scrape first."""
+    meta = json_mgr.data.get("_meta", {})
+    parts = [
+        (meta.get(scrape_key + "_status"), meta.get(scrape_key + "_reason", "unknown")),
+        (meta.get(_ROW_KEYS[fetch_code] + "_status"),
+         meta.get(_ROW_KEYS[fetch_code] + "_reason", "unknown")),
+        (meta.get(_ROW_KEYS[resolve_code] + "_status"),
+         meta.get(_ROW_KEYS[resolve_code] + "_reason", "unknown")),
+    ]
+    for status, reason in parts:
+        if status == "failed":
+            return "failed - {}".format(reason or "unknown")
+    if all(status == "pass" for status, _ in parts):
+        return "success"
+    return "-"
+
+
+def _side_label(name, json_mgr, fetch_code, resolve_code):
+    fetch_done, fetch_total = _row_counts(json_mgr, fetch_code)
+    resolve_done, resolve_total = _row_counts(json_mgr, resolve_code)
+    return "{} [ {}/{} Cat - {}/{} Ch ]".format(name, fetch_done, fetch_total,
+                                               resolve_done, resolve_total)
 
 
 def show_hub_header(json_mgr):
@@ -614,26 +681,11 @@ def show_hub_header(json_mgr):
     print("=" * 60)
     print()
 
-    # Scrape categories status: success, failed - xxx, or -
-    cat_codes = ["C2", "D1"]
-    cat_done = sum(1 for code in cat_codes if json_mgr.is_done(code))
-    scrape_meta = json_mgr.data.get("_meta", {})
-    if cat_done == len(cat_codes) and scrape_meta.get("scrape_status") == "pass":
-        cat_status = "success"
-    elif "scrape_status" not in scrape_meta:
-        cat_status = "-"
-    else:
-        cat_status = "failed - {}".format(scrape_meta.get("scrape_reason", "unknown"))
-
     print("  {} {:<45} {}".format(">>" if _hub_pos == 0 else "  ", "handshake", handshake_status(json_mgr)))
     print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 1 else "  ", "Categories Scraper", cat_status))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 1 else "  ", _side_label("Channels", json_mgr, "C5", "C4"), _side_status(json_mgr, "scrape_live", "C5", "C4")))
     print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", _row_label("Channels Scraper", json_mgr, "C5"), _row_status(json_mgr, "C5")))
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", _row_label("Channels Resolver", json_mgr, "C4"), _row_status(json_mgr, "C4")))
-    print()
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 4 else "  ", _row_label("Vod Scraper", json_mgr, "D4"), _row_status(json_mgr, "D4")))
-    print("  {} {:<45} {}".format(">>" if _hub_pos == 5 else "  ", _row_label("Vod Resolver", json_mgr, "D3"), _row_status(json_mgr, "D3")))
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", _side_label("Vod", json_mgr, "D4", "D3"), _side_status(json_mgr, "scrape_movies", "D4", "D3")))
     print()
     print("-" * 60)
     if _hub_full:
@@ -664,7 +716,7 @@ def hub_loop(client, json_mgr, is_restored):
     for pos, code in enumerate(_ORDER):
         _hub_pos = pos
         ok = True
-        if code == "SCRAPE":
+        if code == "LIVE":
             cat_codes = ["C2", "D1"]
             # Always reset so it scrapes again at once
             for c in cat_codes:
@@ -676,26 +728,45 @@ def hub_loop(client, json_mgr, is_restored):
             json_mgr.data["_meta"]["scraped_at"] = ""
             json_mgr.save()
             _scrape_fail_reason = ""
-            for next_code in cat_codes:
+            for next_code in ("C2", "C5", "C4"):
                 show_hub_header(json_mgr)
                 print()
                 print("  > ")
                 idx, _, desc, info, is_auto = get_step_info(next_code)
                 run_single_step(client, json_mgr, next_code, desc, info, is_auto)
+        elif code == "VOD":
+            show_hub_header(json_mgr)
+            print()
+            print("  > ")
+            idx, _, desc, info, is_auto = get_step_info("D1")
+            run_single_step(client, json_mgr, "D1", desc, info, is_auto)
             meta = json_mgr.data.setdefault("_meta", {})
             if _scrape_fail_reason:
-                ok = False
                 meta["scrape_status"] = "failed"
                 meta["scrape_reason"] = _scrape_fail_reason
             elif (len(json_mgr.data.get("live", {}).get("categories", [])) == 0
                     and len(json_mgr.data.get("movies", {}).get("categories", [])) == 0):
-                ok = False
                 meta["scrape_status"] = "failed"
                 meta["scrape_reason"] = "no category"
             else:
                 meta["scrape_status"] = "pass"
                 meta.pop("scrape_reason", None)
             json_mgr.save()
+            both_zero = (len(json_mgr.data.get("live", {}).get("categories", [])) == 0
+                         and len(json_mgr.data.get("movies", {}).get("categories", [])) == 0)
+            if both_zero:
+                ok = False
+            else:
+                show_hub_header(json_mgr)
+                print()
+                print("  > ")
+                idx, _, desc, info, is_auto = get_step_info("D4")
+                run_single_step(client, json_mgr, "D4", desc, info, is_auto)
+                show_hub_header(json_mgr)
+                print()
+                print("  > ")
+                idx, _, desc, info, is_auto = get_step_info("D3")
+                run_single_step(client, json_mgr, "D3", desc, info, is_auto)
         else:
             show_hub_header(json_mgr)
             print()
@@ -786,6 +857,9 @@ def run_category_scrape_no_probe(client, json_mgr, code, desc):
     fname, status_str, is_error, is_200 = handle_fetch_result(result, code, safe_name, cache=cache)
     if is_error:
         _scrape_fail_reason = handshake_reason(result)
+        _save_step_outcome(json_mgr,
+                           "scrape_live" if code == "C2" else "scrape_movies",
+                           False, _scrape_fail_reason)
         return False, "  -> [!] Failed — saved error to {}".format(fname)
     msg = "  -> [OK] Saved to {}".format(fname)
     data = result.get("_data")
@@ -799,6 +873,9 @@ def run_category_scrape_no_probe(client, json_mgr, code, desc):
             cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
             cats = [c for c in cats if str(c.get("id")) != "*"][:50]
             json_mgr.update_movie_categories(cats)
+    _save_step_outcome(json_mgr,
+                       "scrape_live" if code == "C2" else "scrape_movies",
+                       True)
     return True, msg
 
 
@@ -837,8 +914,8 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
     time.sleep(3)
     print()
     pass_text = {
-        "C2": "Categories scraper success",
-        "D1": "Categories scraper success",
+        "C2": "Channels scraper success",
+        "D1": "Vod scraper success",
         "C5": "Channels scraper success",
         "C4": "Channels resolver success",
         "D4": "Vod scraper success",
@@ -846,7 +923,10 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
     }
     if success:
         json_mgr.mark_done(code)
-        print("  -> {}".format(pass_text.get(code, "success")))
+        if code in ("C4", "D3"):
+            print("  -> {}".format(_row_status(json_mgr, code)))
+        else:
+            print("  -> {}".format(pass_text.get(code, "success")))
     else:
         reason = ""
         if code in ("C2", "D1"):
@@ -888,6 +968,8 @@ def _run_one(portal, mac, idx, total):
     meta.pop("scraped_at", None)
     for key in ("handshake_status", "handshake_reason",
                 "scrape_status", "scrape_reason",
+                "scrape_live_status", "scrape_live_reason",
+                "scrape_movies_status", "scrape_movies_reason",
                 "fetch_live_status", "fetch_live_reason",
                 "fetch_movies_status", "fetch_movies_reason",
                 "resolve_live_status", "resolve_live_reason",
