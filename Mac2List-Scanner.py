@@ -162,7 +162,11 @@ def fetch_all_live_no_viewer(client, json_mgr):
         subset = by_cat.get(cid, [])
         json_mgr.update_live_channels(cid, subset, len(subset))
     if not kept:
-        _save_step_outcome(json_mgr, "fetch_live", False, "empty")
+        source_total = sum(len(items) for _, items in collected)
+        if source_total == 0:
+            _save_step_outcome(json_mgr, "fetch_live", False, "no channel")
+        else:
+            _save_step_outcome(json_mgr, "fetch_live", False, "empty")
     else:
         _save_step_outcome(json_mgr, "fetch_live", True)
     return True
@@ -234,7 +238,11 @@ def fetch_all_movies_no_viewer(client, json_mgr):
         subset = by_cat.get(cid, [])
         json_mgr.update_movie_items(cid, subset, len(subset))
     if not kept:
-        _save_step_outcome(json_mgr, "fetch_movies", False, "empty")
+        source_total = sum(len(items) for _, items in collected)
+        if source_total == 0:
+            _save_step_outcome(json_mgr, "fetch_movies", False, "no channel")
+        else:
+            _save_step_outcome(json_mgr, "fetch_movies", False, "empty")
     else:
         _save_step_outcome(json_mgr, "fetch_movies", True)
     return True
@@ -470,27 +478,34 @@ def _portal_status(session):
 
     live_done, live_total = _pct("live", "channels")
     vod_done, vod_total = _pct("movies", "items")
-    if live_done + vod_done > 0:
+    if live_done > 0 and vod_done > 0:
+        if live_done == live_total and vod_done == vod_total:
+            return "success"
+        pct = int((live_done + vod_done) * 100 / (live_total + vod_total))
+        return "success - {}%".format(pct)
+    if live_done > 0:
         live_pct = int(live_done * 100 / live_total) if live_total else 0
+        return "success - {}% LIVE".format(live_pct)
+    if vod_done > 0:
         vod_pct = int(vod_done * 100 / vod_total) if vod_total else 0
-        return "success - {}% LIVE / {}% VOD".format(live_pct, vod_pct)
+        return "success - {}% VOD".format(vod_pct)
     if meta.get("scrape_status") == "failed" and meta.get("scrape_reason") == "no category":
         return "No category"
 
-    def _side_cause(scrape_key, fetch_key, resolve_key):
-        for key in (scrape_key, fetch_key, resolve_key):
-            if meta.get(key + "_status") == "failed":
-                return meta.get(key + "_reason", "unknown") or "unknown"
-        return ""
-
-    live_cause = _side_cause("scrape_live", "fetch_live", "resolve_live")
-    vod_cause = _side_cause("scrape_movies", "fetch_movies", "resolve_movies")
-    if live_cause and vod_cause:
-        return "Live {} / Vod {}".format(live_cause, vod_cause)
-    if live_cause:
-        return "Live {}".format(live_cause)
-    if vod_cause:
-        return "Vod {}".format(vod_cause)
+    reasons = []
+    for key in ("scrape_live", "fetch_live", "resolve_live",
+                "scrape_movies", "fetch_movies", "resolve_movies"):
+        if meta.get(key + "_status") == "failed":
+            reasons.append(meta.get(key + "_reason", "unknown") or "unknown")
+    for reason in reasons:
+        if reason.startswith("HTTP"):
+            return reason
+    if "timeout" in reasons:
+        return "timeout"
+    if "no channel" in reasons:
+        return "No channel"
+    if reasons:
+        return "Broken data"
     ran = [meta.get("handshake_status"), meta.get("scrape_status"),
            meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
            meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
@@ -804,7 +819,7 @@ def fetch_reason(result):
         if status is None:
             return "connection"
         return "HTTP {}".format(status)
-    return "bad data"
+    return "no channel"
 
 
 def handshake_status(json_mgr):
