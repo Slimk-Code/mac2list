@@ -11,6 +11,8 @@ import os
 import sys
 import time
 
+import requests
+
 from core.config import (
     OUTPUT_DIR,
     SESSION_DIR,
@@ -445,7 +447,7 @@ def _session_meta(session):
 
 
 def _portal_status(session):
-    """Merged success line when links exist, else combined side causes."""
+    """Checker success line when links checked, else combined side causes."""
     data = _session_data(session)
     meta = data.get("_meta", {})
     if not isinstance(meta, dict):
@@ -453,48 +455,26 @@ def _portal_status(session):
     if meta.get("handshake_status") == "failed":
         return "Handshake - {}".format(meta.get("handshake_reason", "unknown"))
 
-    def _pct(section, bucket):
-        sec = data.get(section, {})
-        if not isinstance(sec, dict):
-            return 0, 0
-        items = sec.get("categories", [])
-        if not isinstance(items, list):
-            return 0, 0
-        total = 0
-        done = 0
-        for cat in items:
-            if not isinstance(cat, dict):
-                continue
-            bucket_items = cat.get(bucket, [])
-            if not isinstance(bucket_items, list):
-                continue
-            for it in bucket_items:
-                if not isinstance(it, dict):
-                    continue
-                total += 1
-                if it.get("resolved_url"):
-                    done += 1
-        return done, total
-
-    live_done, live_total = _pct("live", "channels")
-    vod_done, vod_total = _pct("movies", "items")
-    if live_done > 0 and vod_done > 0:
-        if live_done == live_total and vod_done == vod_total:
+    try:
+        check_alive = int(meta.get("check_alive", 0) or 0)
+    except (TypeError, ValueError):
+        check_alive = 0
+    try:
+        check_total = int(meta.get("check_total", 0) or 0)
+    except (TypeError, ValueError):
+        check_total = 0
+    if check_total > 0:
+        if check_alive >= check_total:
             return "success"
-        pct = int((live_done + vod_done) * 100 / (live_total + vod_total))
-        return "success - {}%".format(pct)
-    if live_done > 0:
-        live_pct = int(live_done * 100 / live_total) if live_total else 0
-        return "success - {}% LIVE".format(live_pct)
-    if vod_done > 0:
-        vod_pct = int(vod_done * 100 / vod_total) if vod_total else 0
-        return "success - {}% VOD".format(vod_pct)
+        if check_alive > 0:
+            return "success - {}%".format(int(check_alive * 100 / check_total))
     if meta.get("scrape_status") == "failed" and meta.get("scrape_reason") == "no category":
         return "No category"
 
     reasons = []
     for key in ("scrape_live", "fetch_live", "resolve_live",
-                "scrape_movies", "fetch_movies", "resolve_movies"):
+                "scrape_movies", "fetch_movies", "resolve_movies",
+                "check"):
         if meta.get(key + "_status") == "failed":
             reasons.append(meta.get(key + "_reason", "unknown") or "unknown")
     for reason in reasons:
@@ -508,7 +488,8 @@ def _portal_status(session):
         return "Broken data"
     ran = [meta.get("handshake_status"), meta.get("scrape_status"),
            meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
-           meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
+           meta.get("resolve_live_status"), meta.get("resolve_movies_status"),
+           meta.get("check_status")]
     if any(r in ("pass", "failed") for r in ran):
         return "No Data"
     return "-"
@@ -596,32 +577,112 @@ def run_resume_or_new():
 # PAGE 2 — MAIN HUB
 # ============================================================
 # Sequential hub order: one Enter runs the full order automatically.
-_ORDER = ["A1", "LIVE", "VOD"]
+_ORDER = ["A1", "LIVE", "VOD", "CHECK"]
 _hub_pos = 0
 
 
 def run_hub_handshake(client, json_mgr):
-    """Fixed rhythm: Executing, running, pause, result, pause."""
+    """Three screens: work, fresh menu plus pause, menu plus saved line."""
     _, _, desc, _, _ = get_step_info("A1")
     print()
     print("  Executing: A1 — {}".format(desc))
     print()
     success, _ = run_handshake_step(client, json_mgr)
-    time.sleep(3)
-    print()
     if success:
         json_mgr.mark_done("A1")
-        print("  -> Handshake success")
-    else:
-        reason = json_mgr.data.get("_meta", {}).get("handshake_reason", "unknown")
-        print("  -> failed - {}".format(reason))
+    time.sleep(3)
+    print()
     print("  -> session saved")
     time.sleep(3)
     return success
 
 
+_CHECK_TIMEOUT = 10
+
+
+def _check_link(url):
+    """Open one collected link, read the first chunk only.
+    Returns (alive_bool, reason)."""
+    try:
+        resp = requests.get(url, timeout=_CHECK_TIMEOUT, stream=True,
+                            allow_redirects=True)
+    except Exception as e:
+        msg = str(e).lower()
+        if "timeout" in msg or "timed out" in msg:
+            return False, "timeout"
+        return False, "connection"
+    try:
+        if resp.status_code != 200:
+            return False, "HTTP {}".format(resp.status_code)
+        try:
+            chunk = next(resp.iter_content(chunk_size=32768), b"")
+        except Exception:
+            return False, "no-data"
+        if chunk:
+            return True, ""
+        return False, "no-data"
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def run_check_links(client, json_mgr):
+    """Check every collected m3u link, persist alive share."""
+    session_id = json_mgr.cache.session_id
+    urls = []
+    for folder in ("live", "vod"):
+        folder_path = os.path.join(OUTPUT_DIR, session_id, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        for name in sorted(os.listdir(folder_path)):
+            if not name.endswith(".m3u"):
+                continue
+            with open(os.path.join(folder_path, name),
+                      encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        urls.append(line)
+    total = len(urls)
+    meta = json_mgr.data.setdefault("_meta", {})
+    if total == 0:
+        meta["check_alive"] = 0
+        meta["check_total"] = 0
+        _save_step_outcome(json_mgr, "check", False, "empty")
+        return False
+    print()
+    alive = 0
+    fail_count = 0
+    first_err = ""
+    for i, url in enumerate(urls):
+        ok, err = _check_link(url)
+        if ok:
+            alive += 1
+        else:
+            fail_count += 1
+            if not first_err:
+                first_err = err or "unknown"
+        line = "  -> Checking: [{}/{}]".format(i + 1, total)
+        if fail_count:
+            line += "  |  {} failed".format(fail_count)
+        sys.stdout.write(chr(13) + line.ljust(80))
+        sys.stdout.flush()
+        time.sleep(0.1)
+    _clear_batch_counter()
+    meta["check_alive"] = alive
+    meta["check_total"] = total
+    if alive == 0:
+        _save_step_outcome(json_mgr, "check", False, first_err)
+    else:
+        _save_step_outcome(json_mgr, "check", True)
+    return alive > 0
+
+
 _ROW_KEYS = {"C5": "fetch_live", "C4": "resolve_live",
-             "D4": "fetch_movies", "D3": "resolve_movies"}
+             "D4": "fetch_movies", "D3": "resolve_movies",
+             "CHK": "check"}
 
 
 def _row_counts(json_mgr, code):
@@ -644,11 +705,17 @@ def _row_counts(json_mgr, code):
         total = sum(1 for c in cats for _ in c.get("items", []))
         done = sum(1 for c in cats for m in c.get("items", []) if m.get("resolved_url"))
         return done, total
+    if code == "CHK":
+        meta = json_mgr.data.get("_meta", {})
+        try:
+            return int(meta.get("check_alive", 0) or 0), int(meta.get("check_total", 0) or 0)
+        except (TypeError, ValueError):
+            return 0, 0
     return 0, 0
 
 
 def _row_status(json_mgr, code):
-    """success plus percent, failed - xxx, or - from the saved step outcome."""
+    """success plus reason, failed - xxx, or - from the saved step outcome."""
     meta = json_mgr.data.get("_meta", {})
     key = _ROW_KEYS.get(code, "")
     if meta.get(key + "_status") == "pass":
@@ -701,6 +768,8 @@ def show_hub_header(json_mgr):
     print("  {} {:<45} {}".format(">>" if _hub_pos == 1 else "  ", _side_label("Channels", json_mgr, "C5", "C4"), _side_status(json_mgr, "scrape_live", "C5", "C4")))
     print()
     print("  {} {:<45} {}".format(">>" if _hub_pos == 2 else "  ", _side_label("Vod", json_mgr, "D4", "D3"), _side_status(json_mgr, "scrape_movies", "D4", "D3")))
+    print()
+    print("  {} {:<45} {}".format(">>" if _hub_pos == 3 else "  ", "Link Checker ({}/{})".format(*_row_counts(json_mgr, "CHK")), _row_status(json_mgr, "CHK")))
     print()
     print("-" * 60)
     if _hub_full:
@@ -782,6 +851,11 @@ def hub_loop(client, json_mgr, is_restored):
                 print("  > ")
                 idx, _, desc, info, is_auto = get_step_info("D3")
                 run_single_step(client, json_mgr, "D3", desc, info, is_auto)
+        elif code == "CHECK":
+            show_hub_header(json_mgr)
+            print()
+            print("  > ")
+            ok = run_single_step(client, json_mgr, "CHK", "Link Checker", "", False)
         else:
             show_hub_header(json_mgr)
             print()
@@ -925,31 +999,13 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto):
             success = fetch_all_live_no_viewer(client, json_mgr)
         elif code == "D4":
             success = fetch_all_movies_no_viewer(client, json_mgr)
+    elif code == "CHK":
+        success = run_check_links(client, json_mgr)
 
     time.sleep(3)
     print()
-    pass_text = {
-        "C2": "Channels scraper success",
-        "D1": "Vod scraper success",
-        "C5": "Channels scraper success",
-        "C4": "Channels resolver success",
-        "D4": "Vod scraper success",
-        "D3": "Vod resolver success",
-    }
     if success:
         json_mgr.mark_done(code)
-        if code in ("C4", "D3"):
-            print("  -> {}".format(_row_status(json_mgr, code)))
-        else:
-            print("  -> {}".format(pass_text.get(code, "success")))
-    else:
-        reason = ""
-        if code in ("C2", "D1"):
-            reason = _scrape_fail_reason or json_mgr.data.get("_meta", {}).get("scrape_reason", "")
-        if reason:
-            print("  -> failed - {}".format(reason))
-        else:
-            print("  -> failed")
     print("  -> session saved")
     print()
     _cooldown()
@@ -988,7 +1044,9 @@ def _run_one(portal, mac, idx, total):
                 "fetch_live_status", "fetch_live_reason",
                 "fetch_movies_status", "fetch_movies_reason",
                 "resolve_live_status", "resolve_live_reason",
-                "resolve_movies_status", "resolve_movies_reason"):
+                "resolve_movies_status", "resolve_movies_reason",
+                "check_status", "check_reason",
+                "check_alive", "check_total"):
         meta.pop(key, None)
     for section in ("live", "movies"):
         sec = json_mgr.data.get(section)
@@ -1008,18 +1066,24 @@ def _run_one(portal, mac, idx, total):
 
 
 def _scan_again(session):
-    """Second-plus runs: never-scanned, handshake-timeout or scrape-timeout only."""
+    """Second-plus runs: everything reruns except dead handshakes.
+
+    Skipped only when the saved handshake failed with an HTTP 4xx code
+    or a connection failure. Timeouts, 5xx, no-token, half-done,
+    fully passed and never-scanned portals all run full again."""
     meta = _session_meta(session)
-    ran = [meta.get("handshake_status"), meta.get("scrape_status"),
-           meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
-           meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
-    if not any(r in ("pass", "failed") for r in ran):
-        return True
-    if (meta.get("handshake_status") == "failed"
-            and meta.get("handshake_reason") == "timeout"):
-        return True
-    return (meta.get("scrape_status") == "failed"
-            and meta.get("scrape_reason") == "timeout")
+    if meta.get("handshake_status") == "failed":
+        reason = meta.get("handshake_reason", "") or ""
+        if reason == "connection":
+            return False
+        if reason.startswith("HTTP"):
+            try:
+                code = int(reason.split()[1])
+            except (IndexError, ValueError):
+                code = 0
+            if 400 <= code <= 499:
+                return False
+    return True
 
 
 def main():
