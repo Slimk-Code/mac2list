@@ -8,6 +8,7 @@ screen, menu, progress renderer and the main() entry point.
 """
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -256,7 +257,7 @@ def fetch_all_movies_no_viewer(client, json_mgr):
 def save_section_m3u(json_mgr, section, folder):
     """Write one section m3u straight into its folder. No other files created."""
     session_id = json_mgr.cache.session_id
-    out_dir = os.path.join(OUTPUT_DIR, session_id, folder)
+    out_dir = os.path.join(OUTPUT_DIR, "dead", session_id, folder)
     os.makedirs(out_dir, exist_ok=True)
     lines = ["#EXTM3U"]
     if section == "live":
@@ -447,7 +448,7 @@ def _session_meta(session):
 
 
 def _portal_status(session):
-    """Checker success line when links checked, else combined side causes."""
+    """HTTP first, checker share next, softer failures after, fresh states last."""
     data = _session_data(session)
     meta = data.get("_meta", {})
     if not isinstance(meta, dict):
@@ -455,19 +456,6 @@ def _portal_status(session):
     if meta.get("handshake_status") == "failed":
         return "Handshake - {}".format(meta.get("handshake_reason", "unknown"))
 
-    try:
-        check_alive = int(meta.get("check_alive", 0) or 0)
-    except (TypeError, ValueError):
-        check_alive = 0
-    try:
-        check_total = int(meta.get("check_total", 0) or 0)
-    except (TypeError, ValueError):
-        check_total = 0
-    if check_total > 0:
-        if check_alive >= check_total:
-            return "success"
-        if check_alive > 0:
-            return "success - {}%".format(int(check_alive * 100 / check_total))
     if meta.get("scrape_status") == "failed" and meta.get("scrape_reason") == "no category":
         return "No category"
 
@@ -480,6 +468,27 @@ def _portal_status(session):
     for reason in reasons:
         if reason.startswith("HTTP"):
             return reason
+
+    try:
+        check_alive = int(meta.get("check_alive", 0) or 0)
+    except (TypeError, ValueError):
+        check_alive = 0
+    try:
+        check_total = int(meta.get("check_total", 0) or 0)
+    except (TypeError, ValueError):
+        check_total = 0
+    try:
+        check_live_alive = int(meta.get("check_live_alive", 0) or 0)
+    except (TypeError, ValueError):
+        check_live_alive = 0
+    try:
+        check_vod_alive = int(meta.get("check_vod_alive", 0) or 0)
+    except (TypeError, ValueError):
+        check_vod_alive = 0
+    if check_live_alive >= 50 and check_vod_alive >= 50:
+        return "health score - 100%"
+    if check_alive > 0 and check_total > 0:
+        return "health score - {}%".format(int(check_alive * 100 / check_total))
     if "timeout" in reasons:
         return "timeout"
     if "no channel" in reasons:
@@ -496,33 +505,39 @@ def _portal_status(session):
 
 
 def _portal_rank(session):
-    """Sort key: pending first, then least progress, fully passed last, locked very last."""
+    """Sort key follows the displayed status: fresh, health 100,
+    health percent desc, HTTP asc, timeout, no channel, No category,
+    Broken data, No Data, handshake errors, locked very last."""
     if session.get("kind") == "pending":
-        return (1, 0, 0, 0, "")
-    meta = _session_meta(session)
-    done = meta.get("done_steps", [])
-    stages = [
-        meta.get("handshake_status") == "pass",
-        meta.get("scrape_status") == "pass" and "C2" in done and "D1" in done,
-        meta.get("fetch_live_status") == "pass",
-        meta.get("fetch_movies_status") == "pass",
-        meta.get("resolve_live_status") == "pass",
-        meta.get("resolve_movies_status") == "pass",
-    ]
-    ran = [meta.get("handshake_status"), meta.get("scrape_status"),
-           meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
-           meta.get("resolve_live_status"), meta.get("resolve_movies_status")]
-    if not any(r in ("pass", "failed") for r in ran):
-        return (0, 0, 0, 0, "")
-    passed = sum(1 for s in stages if s)
-    first_bad = next((i for i, s in enumerate(stages) if not s), len(stages))
-    reason_keys = ["handshake_reason", "scrape_reason",
-                   "fetch_live_reason", "fetch_movies_reason",
-                   "resolve_live_reason", "resolve_movies_reason"]
-    reason = ""
-    if first_bad < len(stages):
-        reason = meta.get(reason_keys[first_bad], "") or ""
-    return (0, 1, passed, first_bad, reason)
+        return (10, 0, 0)
+    status = _portal_status(session)
+    if status == "-":
+        return (0, 0, 0)
+    if status == "success" or status == "health score - 100%":
+        return (1, 0, 0)
+    if status.startswith("health score - "):
+        try:
+            pct = int(status.rsplit("-", 1)[1].strip().rstrip("%"))
+        except (IndexError, ValueError):
+            pct = 0
+        return (2, -pct, 0)
+    if status.startswith("HTTP"):
+        try:
+            code = int(status.split()[1])
+        except (IndexError, ValueError):
+            code = 999
+        return (3, code, 0)
+    if status == "timeout":
+        return (4, 0, 0)
+    if status == "No channel":
+        return (5, 0, 0)
+    if status == "No category":
+        return (6, 0, 0)
+    if status == "Broken data":
+        return (7, 0, 0)
+    if status == "No Data":
+        return (8, 0, 0)
+    return (9, 0, 0)
 
 
 def _select_restore_session(sessions):
@@ -629,23 +644,24 @@ def _check_link(url):
 
 
 def run_check_links(client, json_mgr):
-    """Check every collected m3u link, persist alive share."""
+    """Check m3u links per side up to 50 alive each, persist alive shares."""
     session_id = json_mgr.cache.session_id
-    urls = []
+    sides = {}
     for folder in ("live", "vod"):
-        folder_path = os.path.join(OUTPUT_DIR, session_id, folder)
-        if not os.path.isdir(folder_path):
-            continue
-        for name in sorted(os.listdir(folder_path)):
-            if not name.endswith(".m3u"):
-                continue
-            with open(os.path.join(folder_path, name),
-                      encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        urls.append(line)
-    total = len(urls)
+        folder_path = os.path.join(OUTPUT_DIR, "dead", session_id, folder)
+        folder_urls = []
+        if os.path.isdir(folder_path):
+            for name in sorted(os.listdir(folder_path)):
+                if not name.endswith(".m3u"):
+                    continue
+                with open(os.path.join(folder_path, name),
+                          encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            folder_urls.append(line)
+        sides[folder] = folder_urls
+    total = len(sides["live"]) + len(sides["vod"])
     meta = json_mgr.data.setdefault("_meta", {})
     if total == 0:
         meta["check_alive"] = 0
@@ -656,27 +672,42 @@ def run_check_links(client, json_mgr):
     alive = 0
     fail_count = 0
     first_err = ""
-    for i, url in enumerate(urls):
-        ok, err = _check_link(url)
-        if ok:
-            alive += 1
-        else:
-            fail_count += 1
-            if not first_err:
-                first_err = err or "unknown"
-        line = "  -> Checking: [{}/{}]".format(i + 1, total)
-        if fail_count:
-            line += "  |  {} failed".format(fail_count)
-        sys.stdout.write(chr(13) + line.ljust(80))
-        sys.stdout.flush()
-        time.sleep(0.1)
+    side_alive = {"live": 0, "vod": 0}
+    opened = 0
+    for folder in ("live", "vod"):
+        for url in sides[folder]:
+            if side_alive[folder] >= 50:
+                continue
+            opened += 1
+            ok, err = _check_link(url)
+            if ok:
+                alive += 1
+                side_alive[folder] += 1
+            else:
+                fail_count += 1
+                if not first_err:
+                    first_err = err or "unknown"
+            line = "  -> Checking: [{}/{}]".format(opened, total)
+            if fail_count:
+                line += "  |  {} failed".format(fail_count)
+            sys.stdout.write(chr(13) + line.ljust(80))
+            sys.stdout.flush()
+            time.sleep(0.5)
     _clear_batch_counter()
     meta["check_alive"] = alive
     meta["check_total"] = total
+    meta["check_live_alive"] = side_alive["live"]
+    meta["check_vod_alive"] = side_alive["vod"]
     if alive == 0:
         _save_step_outcome(json_mgr, "check", False, first_err)
     else:
         _save_step_outcome(json_mgr, "check", True)
+        src_root = os.path.join(OUTPUT_DIR, "dead", session_id)
+        dst_root = os.path.join(OUTPUT_DIR, "success", session_id)
+        if os.path.isdir(dst_root):
+            shutil.rmtree(dst_root)
+        if os.path.isdir(src_root):
+            shutil.move(src_root, dst_root)
     return alive > 0
 
 
@@ -1046,7 +1077,8 @@ def _run_one(portal, mac, idx, total):
                 "resolve_live_status", "resolve_live_reason",
                 "resolve_movies_status", "resolve_movies_reason",
                 "check_status", "check_reason",
-                "check_alive", "check_total"):
+                "check_alive", "check_total",
+                "check_live_alive", "check_vod_alive"):
         meta.pop(key, None)
     for section in ("live", "movies"):
         sec = json_mgr.data.get(section)
