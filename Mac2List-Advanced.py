@@ -9,6 +9,7 @@ screen, menu, progress renderer and the main() entry point.
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -448,8 +449,6 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
             num = int(choice)
             if 1 <= num <= total:
                 picked = items[num - 1]
-                if isinstance(picked, dict) and picked.get("kind") == "pending":
-                    continue
                 return picked
 
 
@@ -533,9 +532,7 @@ def _portal_status(session):
 def _portal_rank(session):
     """Sort key follows the displayed status: fresh, health 100,
     health percent desc, HTTP asc, timeout, no channel, No category,
-    Broken data, No Data, handshake errors, locked very last."""
-    if session.get("kind") == "pending":
-        return (10, 0, 0)
+    Broken data, No Data, handshake errors last. All MACs equal."""
     status = _portal_status(session)
     if status == "-":
         return (0, 0, 0)
@@ -578,7 +575,7 @@ def _select_restore_session(sessions):
     def row_fmt(s, idx):
         portal = _domain_of(s.get("portal", ""))[:24]
         mac = str(s.get("mac", ""))[:19]
-        status = "Locked" if s.get("kind") == "pending" else _portal_status(s)
+        status = _portal_status(s)
         return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, status)
 
     sessions = sorted(sessions, key=_portal_rank)
@@ -1765,15 +1762,25 @@ def portal_show_hub_header(json_mgr):
         _total = int(_meta.get('check_total', 0) or 0)
     except (TypeError, ValueError):
         _total = 0
-    if _total > 0:
-        print('      Health Score  —  {}%'.format(int(_alive * 100 / _total)))
+    try:
+        _live = int(_meta.get('check_live_alive', 0) or 0)
+    except (TypeError, ValueError):
+        _live = 0
+    try:
+        _vod = int(_meta.get('check_vod_alive', 0) or 0)
+    except (TypeError, ValueError):
+        _vod = 0
+    if _live >= 50 and _vod >= 50:
+        print('  {:<23} —  100%'.format('Health Score'))
+    elif _total > 0 and _alive > 0:
+        print('  {:<23} —  {}%'.format('Health Score', int(_alive * 100 / _total)))
     else:
-        print('      Health Score  —  -')
+        print('  {:<23} —  -'.format('Health Score'))
     print()
     cat_codes = ['C2', 'D1', 'E1']
     cat_done = sum((1 for code in cat_codes if json_mgr.is_done(code)))
     if cat_done == 0:
-        cat_status = 'Not scraped'
+        cat_status = '0/3 scraped'
     elif cat_done < len(cat_codes):
         cat_status = '{}/{} scraped'.format(cat_done, len(cat_codes))
     else:
@@ -1797,6 +1804,7 @@ def portal_show_hub_header(json_mgr):
     print('  [7] Settings           —  {}/{} done'.format(settings_done, settings_total))
     print('  [8] Auth               —  {}/{} done'.format(auth_done, auth_total))
     print()
+    print('-' * 60)
     print('  [B] Back')
     print()
 
@@ -2178,6 +2186,67 @@ _hub_title_total = 0
 _hub_full = False
 
 
+_CONTENT_CODES = {"C2", "D1", "E1", "C5", "D4", "E5", "C4", "D3", "E4", "E3"}
+
+def _clean_hub_memory(json_mgr):
+    """Health-only fresh: clear live/vod/series content + content done markers,
+    keep every other _meta value (health score, handshake, history)."""
+    for section in ("live", "movies", "series"):
+        sec = json_mgr.data.get(section)
+        if isinstance(sec, dict):
+            sec["categories"] = []
+            for key in [k for k in sec
+                        if k.startswith(("_remaining", "_fetched", "_failed", "_probed"))]:
+                sec[key] = []
+    meta = json_mgr.data.get("_meta", {})
+    if isinstance(meta, dict):
+        done = meta.get("done_steps", [])
+        if isinstance(done, list):
+            meta["done_steps"] = [c for c in done if c not in _CONTENT_CODES]
+        ignored = meta.get("ignored_steps", [])
+        if isinstance(ignored, list):
+            meta["ignored_steps"] = [c for c in ignored if c not in _CONTENT_CODES]
+        if meta.get("last_step") in _CONTENT_CODES:
+            meta.pop("last_step", None)
+        meta.pop("scraped_at", None)
+
+
+def _fresh_session_file(portal, mac):
+    """Health-only clean of saved file: clear live/vod/series + content done
+    markers, keep _meta health/handshake/history and cache untouched."""
+    try:
+        session_id = make_session_id(portal, mac)
+        spath = os.path.join(SESSION_DIR, session_id + ".json")
+        if not os.path.exists(spath):
+            return
+        with open(spath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        for section in ("live", "movies", "series"):
+            sec = data.get(section)
+            if isinstance(sec, dict):
+                sec["categories"] = []
+                for key in [k for k in sec
+                            if k.startswith(("_remaining", "_fetched", "_failed", "_probed"))]:
+                    sec[key] = []
+        meta = data.get("_meta", {})
+        if isinstance(meta, dict):
+            done = meta.get("done_steps", [])
+            if isinstance(done, list):
+                meta["done_steps"] = [c for c in done if c not in _CONTENT_CODES]
+            ignored = meta.get("ignored_steps", [])
+            if isinstance(ignored, list):
+                meta["ignored_steps"] = [c for c in ignored if c not in _CONTENT_CODES]
+            if meta.get("last_step") in _CONTENT_CODES:
+                meta.pop("last_step", None)
+            meta.pop("scraped_at", None)
+        with open(spath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def _run_one(portal, mac, idx, total):
     """Open one portal and run its hub. Fail and done both return here."""
     global _hub_title_idx, _hub_title_total
@@ -2188,29 +2257,7 @@ def _run_one(portal, mac, idx, total):
     # Clean open: drop step state from memory only (no save), so the hub
     # starts pending while the file keeps history for the portal list.
     # The run re-saves fresh outcomes, content and markers as it goes.
-    meta.pop("done_steps", None)
-    meta.pop("last_step", None)
-    meta.pop("ignored_steps", None)
-    meta.pop("scraped_at", None)
-    for key in ("handshake_status", "handshake_reason",
-                "scrape_status", "scrape_reason",
-                "scrape_live_status", "scrape_live_reason",
-                "scrape_movies_status", "scrape_movies_reason",
-                "fetch_live_status", "fetch_live_reason",
-                "fetch_movies_status", "fetch_movies_reason",
-                "resolve_live_status", "resolve_live_reason",
-                "resolve_movies_status", "resolve_movies_reason",
-                "check_status", "check_reason",
-                "check_alive", "check_total",
-                "check_live_alive", "check_vod_alive"):
-        meta.pop(key, None)
-    for section in ("live", "movies"):
-        sec = json_mgr.data.get(section)
-        if isinstance(sec, dict):
-            sec["categories"] = []
-            for key in [k for k in sec
-                        if k.startswith(("_remaining", "_fetched", "_failed", "_probed"))]:
-                sec[key] = []
+    _clean_hub_memory(json_mgr)
     _hub_title_idx = idx
     _hub_title_total = total
     client = Mac2ListPortal(portal, mac)
@@ -2227,9 +2274,11 @@ def _run_one_portal(portal, mac):
     meta = json_mgr.data.setdefault("_meta", {})
     if not meta.get("portal") or not meta.get("mac"):
         json_mgr.set_meta(portal, mac)
+    _clean_hub_memory(json_mgr)
     client = Mac2ListPortal(portal, mac)
     portal_show_hub_header(json_mgr)
     print()
+    print("  > ")
     idx, _, desc, info, is_auto = get_step_info("A1")
     if not run_single_step(client, json_mgr, "A1", desc, info, is_auto):
         return
@@ -2274,11 +2323,6 @@ def main():
             portal = input("  Portal : ").strip()
             if not portal:
                 continue
-            clear_screen()
-            _paint_top_menu(sessions)
-            print()
-            print("  > ")
-            print()
             mac = input("  MAC : ").strip()
             if not mac:
                 continue
@@ -2286,6 +2330,7 @@ def main():
                 print("  [!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
                 _cooldown()
                 continue
+            _fresh_session_file(portal, mac)
             _register_new_portal(portal, mac)
             _hub_full = False
             _run_one(portal, mac, 1, 1)
@@ -2295,8 +2340,7 @@ def main():
                 if mode in ("BACK", "EMPTY"):
                     break
                 if mode == "FULL":
-                    todo = [s for s in payload
-                            if s.get("kind") != "pending" and _scan_again(s)]
+                    todo = [s for s in payload if _scan_again(s)]
                     for i, session in enumerate(todo):
                         _hub_full = True
                         _run_one(session["portal"], session["mac"], i + 1, len(todo))
