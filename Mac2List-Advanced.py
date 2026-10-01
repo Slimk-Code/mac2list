@@ -26,6 +26,7 @@ from core.engine import (
     get_next_pending_step,
     get_step_info,
     resolved_counts,
+    run_auto_fetch_step,
     section_status as _section_status,
     step_progress as _step_progress,
     unlock,
@@ -145,10 +146,36 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
 
         print("-" * 60)
         if max_page > 0:
-            print("  [Enter] Next page  |  [1-{}] Portal Scan  |  [B] Back".format(total))
+            print("  [Enter] Next page  |  [1-{}] Portal Scan  |  [N] New session  |  [B] Back".format(total))
         else:
-            print("  [1-{}] Portal Scan  |  [B] Back".format(total))
+            print("  [1-{}] Portal Scan  |  [N] New session  |  [B] Back".format(total))
         print()
+
+    def _inline_new_session():
+        """Portal + MAC prompts below the list. Returns True when created."""
+        print("  Portal : ", end="")
+        try:
+            portal = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if not portal:
+            return False
+        print("  MAC : ", end="")
+        try:
+            mac = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if not mac:
+            return False
+        if not is_valid_mac(mac):
+            print("  [!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
+            _cooldown()
+            return False
+        _fresh_session_file(portal, mac)
+        _register_new_portal(portal, mac)
+        return True
 
     while True:
         _paint_list()
@@ -156,6 +183,9 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
         choice = input("  > ").strip().upper()
         if choice == "B":
             return None
+        elif choice == "N":
+            _inline_new_session()
+            return "NEW"
         elif choice == "" and max_page > 0:
             page = (page + 1) % (max_page + 1)
         elif choice.isdigit():
@@ -245,27 +275,66 @@ def show_top_menu(sessions):
     return input("  > ").strip().upper()
 
 
+def _empty_list_shell():
+    """List shell when the database is empty. Returns NEW, BACK or EMPTY."""
+    while True:
+        clear_screen()
+        print("=" * 60)
+        print("   mac2list Scanner v1.2 — Page 1/1 — 0 saved")
+        print("=" * 60)
+        print()
+        print("  No saved sessions.")
+        print("-" * 60)
+        print("  [N] New session  |  [B] Back")
+        print()
+        choice = input("  > ").strip().upper()
+        if choice == "B":
+            return "BACK"
+        if choice == "N":
+            print("  Portal : ", end="")
+            try:
+                portal = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not portal:
+                continue
+            print("  MAC : ", end="")
+            try:
+                mac = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not mac:
+                continue
+            if not is_valid_mac(mac):
+                print("  [!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
+                _cooldown()
+                continue
+            _fresh_session_file(portal, mac)
+            _register_new_portal(portal, mac)
+            return "NEW"
+
+
 def run_resume_or_new():
     """Scanner viewer loop. Returns (mode, payload). ONE: (portal, mac, idx,
-    total). FULL: sorted sessions list. BACK: viewer quit. EMPTY: None."""
+    total). FULL: sorted sessions list. BACK: viewer quit. NEW: session made."""
     while True:
         sessions = _database_sessions()
         _cleanup_orphans(sessions)
         if not sessions:
-            clear_screen()
-            print("=" * 60)
-            print("   mac2list Scanner v1.2")
-            print("=" * 60)
-            print()
-            print("  No saved sessions.")
-            _cooldown()
-            return "EMPTY", None
+            outcome = _empty_list_shell()
+            if outcome == "BACK":
+                return "BACK", None
+            continue
 
         picked, sessions = _select_restore_session(sessions)
         if picked is None:
             return "BACK", None
         if picked == "FULL":
             return "FULL", sessions
+        if picked == "NEW":
+            continue
 
         idx = sessions.index(picked) + 1
         return "ONE", (picked["portal"], picked["mac"], idx, len(sessions))
@@ -1524,60 +1593,22 @@ def _run_one_portal(portal, mac):
 
 
 def main():
+    """Boot straight into the scanner list. N creates below the screen."""
     global _hub_full, _hub_pos
     while True:
-        sessions = _database_sessions()
-        _cleanup_orphans(sessions)
-        choice = show_top_menu(sessions)
-        if choice == "Q":
+        mode, payload = run_resume_or_new()
+        if mode in ("BACK", "EMPTY"):
             return
-        if choice == "1":
-            clear_screen()
-            _paint_top_menu(sessions)
-            print()
-            print("  > ")
-            print()
-            portal = input("  Portal : ").strip()
-            if not portal:
-                continue
-            mac = input("  MAC : ").strip()
-            if not mac:
-                continue
-            if not is_valid_mac(mac):
-                print("  [!] Invalid MAC address format. Use format: 00:1A:79:XX:XX:XX")
-                _cooldown()
-                continue
-            _fresh_session_file(portal, mac)
-            _register_new_portal(portal, mac)
-            while True:
-                mode, payload = run_resume_or_new()
-                if mode in ("BACK", "EMPTY"):
-                    break
-                if mode == "FULL":
-                    todo = [s for s in payload if _scan_again(s)]
-                    for i, session in enumerate(todo):
-                        _hub_full = True
-                        _run_one(session["portal"], session["mac"], i + 1, len(todo))
-                    _hub_full = False
-                else:
-                    _hub_full = False
-                    portal, mac, idx, total = payload
-                    _run_one_portal(portal, mac)
-        elif choice == "2" and sessions:
-            while True:
-                mode, payload = run_resume_or_new()
-                if mode in ("BACK", "EMPTY"):
-                    break
-                if mode == "FULL":
-                    todo = [s for s in payload if _scan_again(s)]
-                    for i, session in enumerate(todo):
-                        _hub_full = True
-                        _run_one(session["portal"], session["mac"], i + 1, len(todo))
-                    _hub_full = False
-                else:
-                    _hub_full = False
-                    portal, mac, idx, total = payload
-                    _run_one_portal(portal, mac)
+        if mode == "FULL":
+            todo = [s for s in payload if _scan_again(s)]
+            for i, session in enumerate(todo):
+                _hub_full = True
+                _run_one(session["portal"], session["mac"], i + 1, len(todo))
+            _hub_full = False
+        else:
+            _hub_full = False
+            portal, mac, idx, total = payload
+            _run_one_portal(portal, mac)
 
 
 if __name__ == "__main__":
