@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 """
-mac2list v1.2 — CLI interface.
+mac2list v1.2 — CLI interface (UI shell only).
 
-This file is the ONLY user-facing entry point. All reusable logic lives in the
-silent core/ package (no print/input/screen code). This file contains every
-screen, menu, progress renderer and the main() entry point.
+All reusable logic lives in the silent core/ package (no print/input/screen
+code). This file contains only screens, menus, progress renderers and the
+main() entry point. It talks to core, never to the other UI file.
 """
 import json
 import os
 import re
-import shutil
 import sys
 import time
 
-import requests
-
+import core.hub as _core_hub
 from core.config import (
     CACHE_DIR,
-    DATABASE_FILE,
     DATA_DIR,
     OUTPUT_DIR,
     SECTIONS,
     SESSION_DIR,
     SETTINGS_STEP_CODES,
-    STEP_PARAMS,
 )
 from core.convert import generate_m3u
 from core.engine import (
     get_next_pending_step,
     get_step_info,
     resolved_counts,
-    run_auto_fetch_step,
     section_status as _section_status,
     step_progress as _step_progress,
     unlock,
@@ -41,23 +36,42 @@ from core.fetch import (
     fetch_single_category,
     retry_category_pages,
 )
+from core.hub import (
+    clean_hub_memory as _clean_hub_memory,
+    clear_outcomes_memory,
+    persist_failures_only,
+    fresh_session_file as _fresh_session_file,
+    handshake_status,
+    register_new_portal as _register_new_portal,
+    reset_scrape_fail_reason,
+    row_counts as _row_counts,
+    row_status as _row_status,
+    run_handshake_step,
+    run_step_work,
+    scan_again as _scan_again,
+    side_label as _side_label,
+    side_status as _side_status,
+    sync_outer_meta,
+)
+from core.library import resolve_items_batch
 from core.portal import Mac2ListPortal
 from core.resolve import (
     resolve_episode,
-    resolve_live,
-    resolve_vod,
 )
 from core.sessions import (
     cleanup_orphans as _cleanup_orphans,
     database_sessions as _database_sessions,
     make_session_id,
-    register_session as _register_session,
+)
+from core.status import (
+    health_status as _health_status,
+    portal_rank as _portal_rank,
+    portal_status as _portal_status,
+    session_data as _session_data,
+    session_meta as _session_meta,
 )
 from core.storage import (
     JSONManager,
-    handle_fetch_result,
-    save_error_json,
-    save_json,
 )
 from core.utils import (
     domain_of as _domain_of,
@@ -105,309 +119,6 @@ def _clear_batch_counter():
 
 
 # ============================================================
-# LIVE FIRST PAGE ONLY (interface only, core untouched)
-# ============================================================
-def channel_name_ok(name):
-    """Keep HD/SD names only, drop 4K/8K/UHD/HEVC/FHD names."""
-    low = str(name or "").lower()
-    for bad in ("4k", "8k", "uhd", "hevc", "fhd"):
-        if bad in low:
-            return False
-    return ("hd" in low) or ("sd" in low)
-
-
-def channel_name_clean(name):
-    """Clean names: no bad tags and no hd/sd, used only to fill the gap."""
-    low = str(name or "").lower()
-    for bad in ("4k", "8k", "uhd", "hevc", "fhd"):
-        if bad in low:
-            return False
-    return not channel_name_ok(name)
-
-
-def _save_step_outcome(json_mgr, key, ok, reason=""):
-    """Persist pass or failed plus reason for a hub row status."""
-    meta = json_mgr.data.setdefault("_meta", {})
-    meta[key + "_status"] = "pass" if ok else "failed"
-    if reason:
-        meta[key + "_reason"] = reason
-    else:
-        meta.pop(key + "_reason", None)
-    json_mgr.save()
-
-
-def fetch_all_live_no_viewer(client, json_mgr):
-    """Fetch 1st page of every pending live category first,
-    then filter the entire set at once and keep the first 100."""
-    _, pending, _, _ = _category_status(json_mgr, "live")
-    if not pending:
-        return True
-    print()
-    # Phase 1: fetch everything into memory, no filtering yet
-    collected = []
-    fetched_ids = []
-    first_error = None
-    for i, cat in enumerate(pending):
-        cid = str(cat.get("id"))
-        params = {"type": "itv", "action": "get_ordered_list", "genre": cid, "p": "1", "JsHttpRequest": "1-xml"}
-        result = client.fetch(params)
-        data = result.get("_data")
-        if data and isinstance(data, dict):
-            js = data.get("js", {})
-            if isinstance(js, dict):
-                collected.append((cid, js.get("data", [])))
-                fetched_ids.append(cid)
-            else:
-                if first_error is None:
-                    first_error = result
-                json_mgr.mark_live_genre_failed(cid)
-        else:
-            if first_error is None:
-                first_error = result
-            json_mgr.mark_live_genre_failed(cid)
-        line = "  -> Fetching: [{}/{}] done".format(i + 1, len(pending))
-        sys.stdout.write(chr(13) + line.ljust(80))
-        sys.stdout.flush()
-        time.sleep(0.1)
-    _clear_batch_counter()
-    if not fetched_ids:
-        _save_step_outcome(json_mgr, "fetch_live",
-                           False, fetch_reason(first_error) if first_error is not None else "unknown")
-        return False
-    # Phase 2: filter the entire set at once, keep first 100
-    kept = [(cid, it) for cid, items in collected for it in items
-            if channel_name_ok(it.get("name", it.get("title", "")))]
-    kept = kept[:100]
-    if len(kept) < 100:
-        kept_ids = set(id(it) for _, it in kept)
-        clean = [(cid, it) for cid, items in collected for it in items
-                 if channel_name_clean(it.get("name", it.get("title", "")))
-                 and id(it) not in kept_ids]
-        kept = kept + clean[:100 - len(kept)]
-    # Phase 3: save grouped by category
-    by_cat = {}
-    for cid, it in kept:
-        by_cat.setdefault(cid, []).append(it)
-    for cid in fetched_ids:
-        subset = by_cat.get(cid, [])
-        json_mgr.update_live_channels(cid, subset, len(subset))
-    if not kept:
-        source_total = sum(len(items) for _, items in collected)
-        if source_total == 0:
-            _save_step_outcome(json_mgr, "fetch_live", False, "no channel")
-        else:
-            _save_step_outcome(json_mgr, "fetch_live", False, "empty")
-    else:
-        _save_step_outcome(json_mgr, "fetch_live", True)
-    return True
-
-
-def movie_title_ok(title):
-    """Keep 2010 to 2026 titles only."""
-    text = str(title or "")
-    for year in range(2010, 2027):
-        if str(year) in text:
-            return True
-    return False
-
-
-def fetch_all_movies_no_viewer(client, json_mgr):
-    """Fetch 1st page of every pending VOD category first,
-    then filter the entire set at once and keep the first 100."""
-    _, pending, _, _ = _category_status(json_mgr, "movies")
-    if not pending:
-        return True
-    print()
-    # Phase 1: fetch everything into memory, no filtering yet
-    collected = []
-    fetched_ids = []
-    first_error = None
-    for i, cat in enumerate(pending):
-        cid = str(cat.get("id"))
-        params = {"type": "vod", "action": "get_ordered_list", "category": cid, "p": "1",
-                  "fav": "0", "sortby": "added", "hd": "0", "JsHttpRequest": "1-xml"}
-        result = client.fetch(params)
-        data = result.get("_data")
-        if data and isinstance(data, dict):
-            js = data.get("js", {})
-            if isinstance(js, dict):
-                collected.append((cid, js.get("data", [])))
-                fetched_ids.append(cid)
-            else:
-                if first_error is None:
-                    first_error = result
-                json_mgr.mark_movie_category_failed(cid)
-        else:
-            if first_error is None:
-                first_error = result
-            json_mgr.mark_movie_category_failed(cid)
-        line = "  -> Fetching: [{}/{}] done".format(i + 1, len(pending))
-        sys.stdout.write(chr(13) + line.ljust(80))
-        sys.stdout.flush()
-        time.sleep(0.1)
-    _clear_batch_counter()
-    if not fetched_ids:
-        _save_step_outcome(json_mgr, "fetch_movies",
-                           False, fetch_reason(first_error) if first_error is not None else "unknown")
-        return False
-    # Phase 2: filter the entire set at once, keep first 100
-    kept = [(cid, it) for cid, items in collected for it in items
-            if movie_title_ok(it.get("name", it.get("title", "")))]
-    kept = kept[:100]
-    if len(kept) < 100:
-        kept_ids = set(id(it) for _, it in kept)
-        clean = [(cid, it) for cid, items in collected for it in items
-                 if not movie_title_ok(it.get("name", it.get("title", "")))
-                 and id(it) not in kept_ids]
-        kept = kept + clean[:100 - len(kept)]
-    # Phase 3: save grouped by category
-    by_cat = {}
-    for cid, it in kept:
-        by_cat.setdefault(cid, []).append(it)
-    for cid in fetched_ids:
-        subset = by_cat.get(cid, [])
-        json_mgr.update_movie_items(cid, subset, len(subset))
-    if not kept:
-        source_total = sum(len(items) for _, items in collected)
-        if source_total == 0:
-            _save_step_outcome(json_mgr, "fetch_movies", False, "no channel")
-        else:
-            _save_step_outcome(json_mgr, "fetch_movies", False, "empty")
-    else:
-        _save_step_outcome(json_mgr, "fetch_movies", True)
-    return True
-
-
-# ============================================================
-# RESOLVE ALL + SAVE M3U (interface only, core untouched)
-# ============================================================
-def save_section_m3u(json_mgr, section, folder):
-    """Write one section m3u straight into its folder. No other files created."""
-    session_id = json_mgr.cache.session_id
-    out_dir = os.path.join(OUTPUT_DIR, "dead", session_id, folder)
-    os.makedirs(out_dir, exist_ok=True)
-    lines = ["#EXTM3U"]
-    if section == "live":
-        for cat in json_mgr.data["live"].get("categories", []):
-            group = cat.get("title", "General")
-            for ch in cat.get("channels", []):
-                url = ch.get("resolved_url", "")
-                if not url:
-                    continue
-                name = ch.get("name", "Unknown")
-                logo = ch.get("logo", "")
-                lines.append('#EXTINF:-1 tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}'.format(
-                    ch.get("id", ""), name, logo, group, name))
-                lines.append(url)
-        path = os.path.join(out_dir, "{}_LIVE.m3u".format(session_id))
-    else:
-        for cat in json_mgr.data["movies"].get("categories", []):
-            group = cat.get("title", "Movies")
-            for m in cat.get("items", []):
-                url = m.get("resolved_url", "")
-                if not url:
-                    continue
-                name = m.get("name", "Unknown")
-                logo = m.get("logo", "")
-                lines.append('#EXTINF:-1 tvg-id="{}" tvg-name="{}" tvg-logo="{}" group-title="{}",{}'.format(
-                    m.get("id", ""), name, logo, group, name))
-                lines.append(url)
-        path = os.path.join(out_dir, "{}_MOVIE.m3u".format(session_id))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    return path
-
-
-def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_type, folder):
-    """Resolve every pending item at once, no picker, then save section m3u to its folder."""
-    items = []
-    for cat in json_mgr.data[section].get("categories", []):
-        for it in cat.get(bucket, []):
-            items.append(it)
-    if not items:
-        print("  No items available. Fetch items first.")
-        _cooldown()
-        return False
-
-    cache = getattr(json_mgr, "cache", None)
-    existing_responses = []
-    if cache:
-        step_path = cache.step_path(step_code)
-        if step_path and os.path.exists(step_path):
-            try:
-                with open(step_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-                if isinstance(existing, dict):
-                    existing_responses = existing.get("responses", [])
-            except Exception:
-                pass
-
-    pending = [it for it in items if not it.get("resolved_url")]
-    print()
-    total = len(pending)
-    fail_count = 0
-    nocmd_count = 0
-    for i, item in enumerate(pending):
-        if not item.get("cmd"):
-            nocmd_count += 1
-            fail_count += 1
-        elif action_type == "itv":
-            resolved_url, raw = resolve_live(client, json_mgr, item)
-            existing_responses.append({
-                "id": item.get("id", ""),
-                "name": item.get("name", item.get("title", "")),
-                "raw_response": raw if raw else item.get("cmd", "")
-            })
-            if not resolved_url:
-                fail_count += 1
-        else:
-            resolved_url, raw = resolve_vod(client, json_mgr, item)
-            if resolved_url:
-                existing_responses.append({
-                    "id": item.get("id", ""),
-                    "name": item.get("name", item.get("title", "")),
-                    "raw_response": raw
-                })
-            else:
-                fail_count += 1
-        line = "  -> Resolving: [{}/{}]".format(i + 1, total)
-        if fail_count:
-            line += "  |  {} failed".format(fail_count)
-        sys.stdout.write(chr(13) + line.ljust(80))
-        sys.stdout.flush()
-        time.sleep(0.3)
-    _clear_batch_counter()
-    if cache:
-        step_path = cache.step_path(step_code)
-        if step_path:
-            step_data = {
-                "_status": "done",
-                "_total_resolved": len(existing_responses),
-                "_total_failed": fail_count,
-                "responses": existing_responses
-            }
-            os.makedirs(os.path.dirname(step_path), exist_ok=True)
-            with open(step_path, "w", encoding="utf-8") as f:
-                json.dump(step_data, f, indent=2, ensure_ascii=False)
-
-    save_section_m3u(json_mgr, section, folder)
-    rkey = "resolve_live" if section == "live" else "resolve_movies"
-    dead = fail_count - nocmd_count
-    live = total - fail_count
-    if total == 0:
-        _save_step_outcome(json_mgr, rkey, True)
-    elif live > 0 and dead > 0:
-        _save_step_outcome(json_mgr, rkey, True, "{}%".format(int(live * 100 / total)))
-    elif dead > 0:
-        _save_step_outcome(json_mgr, rkey, False, "{} dead".format(dead))
-    elif nocmd_count > 0:
-        _save_step_outcome(json_mgr, rkey, False, "no cmd")
-    else:
-        _save_step_outcome(json_mgr, rkey, True)
-    return True
-
-
-# ============================================================
 # PAGE 1 — RESTORE SESSION VIEWER (paged, pick one)
 # ============================================================
 def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
@@ -417,7 +128,7 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
     page = 0
     max_page = (total - 1) // page_size
 
-    while True:
+    def _paint_list():
         clear_screen()
         print("=" * 60)
         print("   {} — Page {}/{} — {} saved".format(title, page + 1, max_page + 1, total))
@@ -432,135 +143,53 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
         for i in range(start, end):
             print(row_fmt_fn(items[i], i + 1))
 
-        print()
+        print("-" * 60)
         if max_page > 0:
-            print("  [Enter] Next page  |  [1-{}] Single Scan  |  [F] Full Scan  |  [B] Back".format(total))
+            print("  [Enter] Next page  |  [1-{}] Portal Scan  |  [B] Back".format(total))
         else:
-            print("  [1-{}] Single Scan  |  [F] Full Scan  |  [B] Back".format(total))
+            print("  [1-{}] Portal Scan  |  [B] Back".format(total))
+        print()
+
+    while True:
+        _paint_list()
 
         choice = input("  > ").strip().upper()
         if choice == "B":
             return None
-        elif choice == "F":
-            return "FULL"
         elif choice == "" and max_page > 0:
             page = (page + 1) % (max_page + 1)
         elif choice.isdigit():
             num = int(choice)
             if 1 <= num <= total:
                 picked = items[num - 1]
-                return picked
-
-
-def _session_data(session):
-    """Full saved session dict for a portal entry, {} when missing."""
-    try:
-        session_id = make_session_id(session.get("portal", ""), session.get("mac", ""))
-        path = os.path.join(SESSION_DIR, session_id + ".json")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
-
-
-def _session_meta(session):
-    """Saved session meta dict for a portal entry, {} when missing."""
-    meta = _session_data(session).get("_meta", {})
-    return meta if isinstance(meta, dict) else {}
-
-
-def _portal_status(session):
-    """HTTP first, checker share next, softer failures after, fresh states last."""
-    data = _session_data(session)
-    meta = data.get("_meta", {})
-    if not isinstance(meta, dict):
-        meta = {}
-    if meta.get("handshake_status") == "failed":
-        return "Handshake - {}".format(meta.get("handshake_reason", "unknown"))
-
-    if meta.get("scrape_status") == "failed" and meta.get("scrape_reason") == "no category":
-        return "No category"
-
-    reasons = []
-    for key in ("scrape_live", "fetch_live", "resolve_live",
-                "scrape_movies", "fetch_movies", "resolve_movies",
-                "check"):
-        if meta.get(key + "_status") == "failed":
-            reasons.append(meta.get(key + "_reason", "unknown") or "unknown")
-    for reason in reasons:
-        if reason.startswith("HTTP"):
-            return reason
-
-    try:
-        check_alive = int(meta.get("check_alive", 0) or 0)
-    except (TypeError, ValueError):
-        check_alive = 0
-    try:
-        check_total = int(meta.get("check_total", 0) or 0)
-    except (TypeError, ValueError):
-        check_total = 0
-    try:
-        check_live_alive = int(meta.get("check_live_alive", 0) or 0)
-    except (TypeError, ValueError):
-        check_live_alive = 0
-    try:
-        check_vod_alive = int(meta.get("check_vod_alive", 0) or 0)
-    except (TypeError, ValueError):
-        check_vod_alive = 0
-    if check_live_alive >= 50 and check_vod_alive >= 50:
-        return "health score - 100%"
-    if check_alive > 0 and check_total > 0:
-        return "health score - {}%".format(int(check_alive * 100 / check_total))
-    if "timeout" in reasons:
-        return "timeout"
-    if "no channel" in reasons:
-        return "No channel"
-    if reasons:
-        return "Broken data"
-    ran = [meta.get("handshake_status"), meta.get("scrape_status"),
-           meta.get("fetch_live_status"), meta.get("fetch_movies_status"),
-           meta.get("resolve_live_status"), meta.get("resolve_movies_status"),
-           meta.get("check_status")]
-    if any(r in ("pass", "failed") for r in ran):
-        return "No Data"
-    return "-"
-
-
-def _portal_rank(session):
-    """Sort key follows the displayed status: fresh, health 100,
-    health percent desc, HTTP asc, timeout, no channel, No category,
-    Broken data, No Data, handshake errors last. All MACs equal."""
-    status = _portal_status(session)
-    if status == "-":
-        return (0, 0, 0)
-    if status == "success" or status == "health score - 100%":
-        return (1, 0, 0)
-    if status.startswith("health score - "):
-        try:
-            pct = int(status.rsplit("-", 1)[1].strip().rstrip("%"))
-        except (IndexError, ValueError):
-            pct = 0
-        return (2, -pct, 0)
-    if status.startswith("HTTP"):
-        try:
-            code = int(status.split()[1])
-        except (IndexError, ValueError):
-            code = 999
-        return (3, code, 0)
-    if status == "timeout":
-        return (4, 0, 0)
-    if status == "No channel":
-        return (5, 0, 0)
-    if status == "No category":
-        return (6, 0, 0)
-    if status == "Broken data":
-        return (7, 0, 0)
-    if status == "No Data":
-        return (8, 0, 0)
-    return (9, 0, 0)
+                _paint_list()
+                print("  > ")
+                print()
+                _, _, _desc, _, _ = get_step_info("A1")
+                print("  Executing: A1 — {}".format(_desc))
+                print()
+                try:
+                    _mgr = JSONManager(picked.get("portal", ""), picked.get("mac", ""))
+                    _mmeta = _mgr.data.setdefault("_meta", {})
+                    if not _mmeta.get("portal") or not _mmeta.get("mac"):
+                        _mgr.set_meta(picked.get("portal", ""), picked.get("mac", ""))
+                    _client = Mac2ListPortal(picked.get("portal", ""), picked.get("mac", ""))
+                    _ok, _msg = run_handshake_step(_client, _mgr)
+                    print(_msg)
+                    if _ok:
+                        _mgr.mark_done("A1")
+                    time.sleep(3)
+                    print()
+                    print("  -> session saved")
+                    time.sleep(1)
+                except Exception as e:
+                    print("  -> [!] Handshake failed — {}.".format(e))
+                    _ok = False
+                    _cooldown(2)
+                if _ok:
+                    return picked
+                _cooldown(2)
+                continue
 
 
 def _select_restore_session(sessions):
@@ -590,7 +219,7 @@ def _paint_top_menu(sessions):
     """Top screen paint without input."""
     clear_screen()
     print("=" * 60)
-    print("   mac2list v1.2")
+    print("   mac2list v1.2 - Advanced Scan")
     print("=" * 60)
     print()
     print("  [1] New session")
@@ -599,6 +228,13 @@ def _paint_top_menu(sessions):
         print("  [2] Restore session")
         print("      {} saved".format(len(sessions)))
         print()
+        for _ in range(1):
+            print()
+        print("-" * 60)
+    else:
+        for _ in range(1):
+            print()
+        print("-" * 60)
     print("  [Q] Quit")
     print()
 
@@ -607,44 +243,6 @@ def show_top_menu(sessions):
     """Top screen mirroring the portal landing. Returns 1, 2 or Q."""
     _paint_top_menu(sessions)
     return input("  > ").strip().upper()
-
-
-def _register_new_portal(portal, mac):
-    """Register a fresh portal with its first MAC active.
-
-    register_session files newcomers under pending_macs, matching the
-    conversion rule that only the first MAC is active. A group created
-    by this very call therefore gets its MAC moved to active_mac, so a
-    brand-new portal never shows up locked."""
-    try:
-        with open(DATABASE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        known = isinstance(data, dict) and any(
-            isinstance(g, dict) and g.get("portal") == portal
-            for g in data.get("portals", []) or [])
-    except Exception:
-        known = False
-    _register_session(portal, mac)
-    if known:
-        return
-    try:
-        with open(DATABASE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return
-        for group in data.get("portals", []) or []:
-            if isinstance(group, dict) and group.get("portal") == portal:
-                if not group.get("active_mac"):
-                    pending = group.get("pending_macs") or []
-                    if mac in pending:
-                        pending.remove(mac)
-                    group["active_mac"] = mac
-                    group["pending_macs"] = pending
-                break
-        with open(DATABASE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
 
 
 def run_resume_or_new():
@@ -697,178 +295,6 @@ def run_hub_handshake(client, json_mgr):
     return success
 
 
-_CHECK_TIMEOUT = 10
-
-
-def _check_link(url):
-    """Open one collected link, read the first chunk only.
-    Returns (alive_bool, reason)."""
-    try:
-        resp = requests.get(url, timeout=_CHECK_TIMEOUT, stream=True,
-                            allow_redirects=True)
-    except Exception as e:
-        msg = str(e).lower()
-        if "timeout" in msg or "timed out" in msg:
-            return False, "timeout"
-        return False, "connection"
-    try:
-        if resp.status_code != 200:
-            return False, "HTTP {}".format(resp.status_code)
-        try:
-            chunk = next(resp.iter_content(chunk_size=32768), b"")
-        except Exception:
-            return False, "no-data"
-        if chunk:
-            return True, ""
-        return False, "no-data"
-    finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
-
-
-def run_check_links(client, json_mgr):
-    """Check m3u links per side up to 50 alive each, persist alive shares."""
-    session_id = json_mgr.cache.session_id
-    sides = {}
-    for folder in ("live", "vod"):
-        folder_path = os.path.join(OUTPUT_DIR, "dead", session_id, folder)
-        folder_urls = []
-        if os.path.isdir(folder_path):
-            for name in sorted(os.listdir(folder_path)):
-                if not name.endswith(".m3u"):
-                    continue
-                with open(os.path.join(folder_path, name),
-                          encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            folder_urls.append(line)
-        sides[folder] = folder_urls
-    total = len(sides["live"]) + len(sides["vod"])
-    meta = json_mgr.data.setdefault("_meta", {})
-    if total == 0:
-        meta["check_alive"] = 0
-        meta["check_total"] = 0
-        _save_step_outcome(json_mgr, "check", False, "empty")
-        return False
-    print()
-    alive = 0
-    fail_count = 0
-    first_err = ""
-    side_alive = {"live": 0, "vod": 0}
-    opened = 0
-    for folder in ("live", "vod"):
-        for url in sides[folder]:
-            if side_alive[folder] >= 50:
-                continue
-            opened += 1
-            ok, err = _check_link(url)
-            if ok:
-                alive += 1
-                side_alive[folder] += 1
-            else:
-                fail_count += 1
-                if not first_err:
-                    first_err = err or "unknown"
-            line = "  -> Checking: [{}/{}]".format(opened, total)
-            if fail_count:
-                line += "  |  {} failed".format(fail_count)
-            sys.stdout.write(chr(13) + line.ljust(80))
-            sys.stdout.flush()
-            time.sleep(0.5)
-    _clear_batch_counter()
-    meta["check_alive"] = alive
-    meta["check_total"] = total
-    meta["check_live_alive"] = side_alive["live"]
-    meta["check_vod_alive"] = side_alive["vod"]
-    if alive == 0:
-        _save_step_outcome(json_mgr, "check", False, first_err)
-    else:
-        _save_step_outcome(json_mgr, "check", True)
-        src_root = os.path.join(OUTPUT_DIR, "dead", session_id)
-        dst_root = os.path.join(OUTPUT_DIR, "success", session_id)
-        if os.path.isdir(dst_root):
-            shutil.rmtree(dst_root)
-        if os.path.isdir(src_root):
-            shutil.move(src_root, dst_root)
-    return alive > 0
-
-
-_ROW_KEYS = {"C5": "fetch_live", "C4": "resolve_live",
-             "D4": "fetch_movies", "D3": "resolve_movies",
-             "CHK": "check"}
-
-
-def _row_counts(json_mgr, code):
-    """(done, total) numbers for a fetch/resolve hub row."""
-    if code == "C5":
-        cats = json_mgr.data["live"].get("categories", [])
-        total = len([c for c in cats if str(c.get("id")) != "*"])
-        return len(json_mgr.get_live_fetched()), total
-    if code == "D4":
-        cats = json_mgr.data["movies"].get("categories", [])
-        total = len([c for c in cats if str(c.get("id")) != "*"])
-        return len(json_mgr.get_movie_fetched()), total
-    if code == "C4":
-        cats = json_mgr.data["live"].get("categories", [])
-        total = sum(1 for c in cats for _ in c.get("channels", []))
-        done = sum(1 for c in cats for ch in c.get("channels", []) if ch.get("resolved_url"))
-        return done, total
-    if code == "D3":
-        cats = json_mgr.data["movies"].get("categories", [])
-        total = sum(1 for c in cats for _ in c.get("items", []))
-        done = sum(1 for c in cats for m in c.get("items", []) if m.get("resolved_url"))
-        return done, total
-    if code == "CHK":
-        meta = json_mgr.data.get("_meta", {})
-        try:
-            return int(meta.get("check_alive", 0) or 0), int(meta.get("check_total", 0) or 0)
-        except (TypeError, ValueError):
-            return 0, 0
-    return 0, 0
-
-
-def _row_status(json_mgr, code):
-    """success plus reason, failed - xxx, or - from the saved step outcome."""
-    meta = json_mgr.data.get("_meta", {})
-    key = _ROW_KEYS.get(code, "")
-    if meta.get(key + "_status") == "pass":
-        reason = meta.get(key + "_reason", "")
-        if reason:
-            return "success - {}".format(reason)
-        return "success"
-    if meta.get(key + "_status") == "failed":
-        return "failed - {}".format(meta.get(key + "_reason", "unknown"))
-    return "-"
-
-
-def _side_status(json_mgr, scrape_key, fetch_code, resolve_code):
-    """success, failed - xxx, or - combined across one side, scrape first."""
-    meta = json_mgr.data.get("_meta", {})
-    parts = [
-        (meta.get(scrape_key + "_status"), meta.get(scrape_key + "_reason", "unknown")),
-        (meta.get(_ROW_KEYS[fetch_code] + "_status"),
-         meta.get(_ROW_KEYS[fetch_code] + "_reason", "unknown")),
-        (meta.get(_ROW_KEYS[resolve_code] + "_status"),
-         meta.get(_ROW_KEYS[resolve_code] + "_reason", "unknown")),
-    ]
-    for status, reason in parts:
-        if status == "failed":
-            return "failed - {}".format(reason or "unknown")
-    if all(status == "pass" for status, _ in parts):
-        return "success"
-    return "-"
-
-
-def _side_label(name, json_mgr, fetch_code, resolve_code):
-    fetch_done, fetch_total = _row_counts(json_mgr, fetch_code)
-    resolve_done, resolve_total = _row_counts(json_mgr, resolve_code)
-    return "{} [ {}/{} Cat - {}/{} Ch ]".format(name, fetch_done, fetch_total,
-                                               resolve_done, resolve_total)
-
-
 def show_hub_header(json_mgr):
     """Print hub header/menu without input prompt."""
     clear_screen()
@@ -877,12 +303,6 @@ def show_hub_header(json_mgr):
     print("   mac2list Scanner v1.2 — {} — {}".format(
         _domain_of(meta.get("portal", "")) or "Main Hub", meta.get("mac", "")))
     print("=" * 60)
-    print()
-
-    _cred = json_mgr.data.get("_meta", {})
-    _cred_text = "{} — {}".format(_domain_of(_cred.get("portal", "")) or "-",
-                                  _cred.get("mac", "") or "-")
-    print("  {} {:<45} {}".format("  ", "Credential", _cred_text))
     print()
     print("  {} {:<45} {}".format(">>" if _hub_pos == 0 else "  ", "handshake", handshake_status(json_mgr)))
     print()
@@ -908,7 +328,7 @@ def show_hub(json_mgr):
 
 def hub_loop(client, json_mgr, is_restored):
     """Main Hub loop: one Enter runs the full order automatically."""
-    global _hub_pos, _scrape_fail_reason
+    global _hub_pos
     _hub_pos = 0
     if not _hub_full:
         while True:
@@ -932,7 +352,7 @@ def hub_loop(client, json_mgr, is_restored):
                         json_mgr.data["_meta"]["done_steps"] = done
             json_mgr.data["_meta"]["scraped_at"] = ""
             json_mgr.save()
-            _scrape_fail_reason = ""
+            reset_scrape_fail_reason()
             for next_code in ("C2", "C5", "C4"):
                 show_hub_header(json_mgr)
                 print()
@@ -946,9 +366,9 @@ def hub_loop(client, json_mgr, is_restored):
             idx, _, desc, info, is_auto = get_step_info("D1")
             run_single_step(client, json_mgr, "D1", desc, info, is_auto)
             meta = json_mgr.data.setdefault("_meta", {})
-            if _scrape_fail_reason:
+            if _core_hub.scrape_fail_reason:
                 meta["scrape_status"] = "failed"
-                meta["scrape_reason"] = _scrape_fail_reason
+                meta["scrape_reason"] = _core_hub.scrape_fail_reason
             elif (len(json_mgr.data.get("live", {}).get("categories", [])) == 0
                     and len(json_mgr.data.get("movies", {}).get("categories", [])) == 0):
                 meta["scrape_status"] = "failed"
@@ -991,137 +411,49 @@ def hub_loop(client, json_mgr, is_restored):
 # ============================================================
 # HANDSHAKE FROM HUB (interface only)
 # ============================================================
-def handshake_reason(result):
-    """Short failure word for a handshake result: timeout, connection, HTTP code, or no token."""
-    err = str(result.get("_error") or "").lower()
-    if "timeout" in err or "timed out" in err:
-        return "timeout"
-    if not result.get("_data"):
-        status = result.get("_status")
-        if status is None:
-            return "connection"
-        return "HTTP {}".format(status)
-    return "no token"
-
-
-def fetch_reason(result):
-    """Short failure word for a category fetch result."""
-    err = str(result.get("_error") or "").lower()
-    if "timeout" in err or "timed out" in err:
-        return "timeout"
-    if not result.get("_data"):
-        status = result.get("_status")
-        if status is None:
-            return "connection"
-        return "HTTP {}".format(status)
-    return "no channel"
-
-
-def handshake_status(json_mgr):
-    """Hub row status: success, failed - xxx, or - when never run."""
-    meta = json_mgr.data.get("_meta", {})
-    outcome = meta.get("handshake_status", "")
-    if outcome == "pass":
-        return "success"
-    if outcome == "failed":
-        return "failed - {}".format(meta.get("handshake_reason", "unknown"))
-    return "-"
-
-
-def run_handshake_step(client, json_mgr):
-    """Run portal handshake again from the hub."""
-    result = client.handshake()
-    cache = getattr(json_mgr, "cache", None)
-    meta = json_mgr.data.setdefault("_meta", {})
-    if not client.token:
-        fname = save_error_json("A1", "handshake", result.get("_status"), result.get("_url"),
-                                result.get("_error"), result.get("_lockedpath"), cache=cache)
-        meta["handshake_status"] = "failed"
-        meta["handshake_reason"] = handshake_reason(result)
-        json_mgr.save()
-        return False, "  -> [!] Handshake failed — no token. Saved error to {}".format(fname)
-    save_json(result.get("_data"), "A1", "handshake", cache=cache)
-    meta["handshake_status"] = "pass"
-    meta.pop("handshake_reason", None)
-    json_mgr.save()
-    return True, "  -> [OK] Handshake OK — token received."
-
-
-# ============================================================
-# CATEGORY SCRAPE WITHOUT FIRST PAGE (interface only)
-# ============================================================
-# Transient scrape failure reason for the current click.
-# Persisted once, after both C2 and D1 finish.
-_scrape_fail_reason = ""
-
-
-def run_category_scrape_no_probe(client, json_mgr, code, desc):
-    """Fetch category list only, no per-category first-page check."""
-    global _scrape_fail_reason
-    params = STEP_PARAMS.get(code)
-    if not params:
-        return False, ""
-    result = client.fetch(params)
-    safe_name = desc.replace("=", "_").replace("&", "_").replace(" ", "_")[:40]
-    cache = getattr(json_mgr, "cache", None)
-    fname, status_str, is_error, is_200 = handle_fetch_result(result, code, safe_name, cache=cache)
-    if is_error:
-        _scrape_fail_reason = handshake_reason(result)
-        _save_step_outcome(json_mgr,
-                           "scrape_live" if code == "C2" else "scrape_movies",
-                           False, _scrape_fail_reason)
-        return False, "  -> [!] Failed — saved error to {}".format(fname)
-    msg = "  -> [OK] Saved to {}".format(fname)
-    data = result.get("_data")
-    if data and isinstance(data, dict):
-        js = data.get("js", {})
-        if code == "C2":
-            cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
-            cats = [c for c in cats if str(c.get("id")) != "*"][:50]
-            json_mgr.update_live_categories(cats)
-        elif code == "D1":
-            cats = js if isinstance(js, list) else (js.get("data", []) if isinstance(js, dict) else [])
-            cats = [c for c in cats if str(c.get("id")) != "*"][:50]
-            json_mgr.update_movie_categories(cats)
-    _save_step_outcome(json_mgr,
-                       "scrape_live" if code == "C2" else "scrape_movies",
-                       True)
-    return True, msg
-
-
-# ============================================================
-# SINGLE STEP EXECUTOR (no prompts, returns to caller)
-# ============================================================
 def run_single_step(client, json_mgr, code, desc, info, is_auto):
-    """Execute a single step. Returns to caller when done."""
+    """Execute a single step. Screen shell around core run_step_work."""
     if code == "A1":
         return run_hub_handshake(client, json_mgr)
     print()
     print("  Executing: {} — {}".format(code, desc))
     print()
 
-    success = False
-    step_msg = ""
+    def _probe_bar(cur, total):
+        progress_bar(cur, total, prefix="  Loading Categories: ")
 
-    if is_auto:
-        if code in ("C2", "D1"):
-            success, step_msg = run_category_scrape_no_probe(client, json_mgr, code, desc)
-        else:
-            def _probe_bar(cur, total):
-                progress_bar(cur, total, prefix="  Loading Categories: ")
-            success, step_msg = run_auto_fetch_step(client, json_mgr, code, desc, probe_progress=_probe_bar)
-    elif code in ("C4", "D3"):
-        if code == "C4":
-            success = resolve_all_no_viewer(client, json_mgr, "C4", "live", "channels", "itv", "live")
-        else:
-            success = resolve_all_no_viewer(client, json_mgr, "D3", "movies", "items", "vod", "vod")
-    elif code in ("C5", "D4"):
-        if code == "C5":
-            success = fetch_all_live_no_viewer(client, json_mgr)
-        elif code == "D4":
-            success = fetch_all_movies_no_viewer(client, json_mgr)
-    elif code == "CHK":
-        success = run_check_links(client, json_mgr)
+    def _fetch_bar(done, total):
+        line = "  -> Fetching: [{}/{}] done".format(done, total)
+        sys.stdout.write(chr(13) + line.ljust(80))
+        sys.stdout.flush()
+        time.sleep(0.1)
+
+    def _resolve_bar(done, total, fails):
+        line = "  -> Resolving: [{}/{}]".format(done, total)
+        if fails:
+            line += "  |  {} failed".format(fails)
+        sys.stdout.write(chr(13) + line.ljust(80))
+        sys.stdout.flush()
+        time.sleep(0.3)
+
+    def _check_bar(opened, total, fails):
+        line = "  -> Checking: [{}/{}]".format(opened, total)
+        if fails:
+            line += "  |  {} failed".format(fails)
+        sys.stdout.write(chr(13) + line.ljust(80))
+        sys.stdout.flush()
+        time.sleep(0.5)
+
+    success, step_msg, empty = run_step_work(
+        client, json_mgr, code, desc,
+        probe_progress=_probe_bar, fetch_progress=_fetch_bar,
+        resolve_progress=_resolve_bar, check_progress=_check_bar)
+    if empty:
+        print(step_msg)
+        _cooldown()
+    elif step_msg:
+        print(step_msg)
+    _clear_batch_counter()
 
     time.sleep(3)
     print()
@@ -1217,6 +549,7 @@ def portal__paged_picker(title, prepare, name_fn, right_fn, right_label, all_don
                 status = '[!]'
             print('  {:<4} {:<8} {:<40} {:<10}'.format(i + 1, status, name, right_fn(item)))
         print()
+        print('-' * 60)
         if total_pending == 0:
             print('  -> [OK] ' + all_done_line(total, fetched_count))
             print()
@@ -1379,18 +712,6 @@ def portal__resolve_items_list(client, json_mgr, step_code, items, title, action
         print('  No items available. Fetch items first.')
         portal__cooldown()
         return False
-    cache = getattr(json_mgr, 'cache', None)
-    existing_responses = []
-    if cache:
-        step_path = cache.step_path(step_code)
-        if step_path and os.path.exists(step_path):
-            try:
-                with open(step_path, 'r', encoding='utf-8') as f:
-                    existing = json.load(f)
-                if isinstance(existing, dict):
-                    existing_responses = existing.get('responses', [])
-            except Exception:
-                pass
     page = 0
     while True:
         pending = [it for it in items if not it.get('resolved_url')]
@@ -1412,38 +733,26 @@ def portal__resolve_items_list(client, json_mgr, step_code, items, title, action
         if not to_resolve:
             continue
         print()
-        fail_count = 0
-        for i, item in enumerate(to_resolve):
-            if action_type == 'itv':
-                resolved_url, raw = resolve_live(client, json_mgr, item)
-                existing_responses.append({'id': item.get('id', ''), 'name': item.get('name', item.get('title', '')), 'raw_response': raw if raw else item.get('cmd', '')})
-            else:
-                resolved_url, raw = resolve_vod(client, json_mgr, item)
-                if resolved_url:
-                    existing_responses.append({'id': item.get('id', ''), 'name': item.get('name', item.get('title', '')), 'raw_response': raw})
-                else:
-                    fail_count += 1
-            pct = (i + 1) / len(to_resolve) * 100
-            filled = int(30 * (i + 1) / len(to_resolve))
+
+        def _resolve_bar(done, total, fails):
+            pct = done / total * 100 if total else 100
+            filled = int(30 * done / total) if total else 30
             bar = '=' * filled + '-' * (30 - filled)
-            line = '  Resolving: [{}] {:5.1f}% ({}/{})'.format(bar, pct, i + 1, len(to_resolve))
-            if fail_count:
-                line += '  |  {} failed'.format(fail_count)
+            line = '  Resolving: [{}] {:5.1f}% ({}/{})'.format(bar, pct, done, total)
+            if fails:
+                line += '  |  {} failed'.format(fails)
             sys.stdout.write(chr(13) + line.ljust(80))
             sys.stdout.flush()
             time.sleep(0.3)
+
+        _ok_count, fail_count = resolve_items_batch(
+            client, json_mgr, step_code, to_resolve, action_type,
+            progress=_resolve_bar)
         print()
         if fail_count:
-            print('  -> [OK] Resolved {}/{} items. {} failed.'.format(len(to_resolve) - fail_count, len(to_resolve), fail_count))
+            print('  -> [OK] Resolved {}/{} items. {} failed.'.format(_ok_count, len(to_resolve), fail_count))
         else:
             print('  -> [OK] Resolved {}/{} items.'.format(len(to_resolve), len(to_resolve)))
-        if cache:
-            step_path = cache.step_path(step_code)
-            if step_path:
-                step_data = {'_status': 'done', '_total_resolved': len(existing_responses), '_total_failed': fail_count, 'responses': existing_responses}
-                os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                with open(step_path, 'w', encoding='utf-8') as f:
-                    json.dump(step_data, f, indent=2, ensure_ascii=False)
         time.sleep(0.5)
 
 def portal__resolve_episodes(client, json_mgr, step_code):
@@ -1543,12 +852,8 @@ def portal__resolve_episodes(client, json_mgr, step_code):
             else:
                 print('  -> [OK] Resolved {}/{} episodes.'.format(len(all_episodes), len(all_episodes)))
             if cache:
-                step_path = cache.step_path(step_code)
-                if step_path:
-                    step_data = {'_status': 'done', '_total_resolved': len(existing_responses), '_total_failed': fail_count, 'responses': existing_responses}
-                    os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                    with open(step_path, 'w', encoding='utf-8') as f:
-                        json.dump(step_data, f, indent=2, ensure_ascii=False)
+                step_data = {'_status': 'done', '_total_resolved': len(existing_responses), '_total_failed': fail_count, 'responses': existing_responses}
+                cache.write_step(step_code, step_data)
             time.sleep(0.5)
             selected_series = None
             continue
@@ -1593,12 +898,8 @@ def portal__resolve_episodes(client, json_mgr, step_code):
         else:
             print('  -> [OK] Resolved {}/{} episodes.'.format(len(episodes), len(episodes)))
         if cache:
-            step_path = cache.step_path(step_code)
-            if step_path:
-                step_data = {'_status': 'done', '_total_resolved': len(existing_responses), '_total_failed': fail_count, 'responses': existing_responses}
-                os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                with open(step_path, 'w', encoding='utf-8') as f:
-                    json.dump(step_data, f, indent=2, ensure_ascii=False)
+            step_data = {'_status': 'done', '_total_resolved': len(existing_responses), '_total_failed': fail_count, 'responses': existing_responses}
+            cache.write_step(step_code, step_data)
         time.sleep(0.5)
         selected_series = None
 
@@ -1670,6 +971,7 @@ def portal__select_paginated(items, title, header_line, row_fmt_fn, page_size=20
         for i in range(start, end):
             print(row_fmt_fn(items[i], i + 1))
         print()
+        print('-' * 60)
         if max_page > 0:
             print('  [Enter] Next page  |  [1-{}] Restore  |  [B] Back'.format(total))
         else:
@@ -1753,29 +1055,9 @@ def portal_show_hub_header(json_mgr):
     print('   mac2list v1.2 — Main Hub')
     print('=' * 60)
     print()
-    _meta = json_mgr.data.get('_meta', {})
-    try:
-        _alive = int(_meta.get('check_alive', 0) or 0)
-    except (TypeError, ValueError):
-        _alive = 0
-    try:
-        _total = int(_meta.get('check_total', 0) or 0)
-    except (TypeError, ValueError):
-        _total = 0
-    try:
-        _live = int(_meta.get('check_live_alive', 0) or 0)
-    except (TypeError, ValueError):
-        _live = 0
-    try:
-        _vod = int(_meta.get('check_vod_alive', 0) or 0)
-    except (TypeError, ValueError):
-        _vod = 0
-    if _live >= 50 and _vod >= 50:
-        print('  {:<23} —  100%'.format('Health Score'))
-    elif _total > 0 and _alive > 0:
-        print('  {:<23} —  {}%'.format('Health Score', int(_alive * 100 / _total)))
-    else:
-        print('  {:<23} —  -'.format('Health Score'))
+    print('  [0] {:<35} —  {}'.format(
+        'Health Check', _health_status(json_mgr.data.get('_meta', {}))))
+    print()
     print()
     cat_codes = ['C2', 'D1', 'E1']
     cat_done = sum((1 for code in cat_codes if json_mgr.is_done(code)))
@@ -1792,17 +1074,17 @@ def portal_show_hub_header(json_mgr):
     auth_section = SECTIONS['Auth']
     auth_done = sum((1 for code, _, _, _ in auth_section['items'] if json_mgr.is_done(code)))
     auth_total = len(auth_section['items'])
-    print('  [1] Scrape Categories  —  {}'.format(cat_status))
+    print('  [1] {:<35} —  {}'.format('Scrape Categories', cat_status))
     print()
-    print('  [2] Live Channels      —  {}'.format(_section_status(json_mgr, 'live', 'ch')))
-    print('  [3] VOD Movies         —  {}'.format(_section_status(json_mgr, 'movies', 'movies')))
-    print('  [4] Series             —  {}'.format(_section_status(json_mgr, 'series', 'series')))
+    print('  [2] {:<35} —  {}'.format('Live Channels', _section_status(json_mgr, 'live', 'ch')))
+    print('  [3] {:<35} —  {}'.format('VOD Movies', _section_status(json_mgr, 'movies', 'movies')))
+    print('  [4] {:<35} —  {}'.format('Series', _section_status(json_mgr, 'series', 'series')))
     print()
-    print('  [5] Watch              —  {} ch, {} movies, {} series'.format(live_count, movie_count, series_count))
-    print('  [6] Convert            —  {}'.format(convert_status))
+    print('  [5] {:<35} —  {} ch, {} movies, {} series'.format('Watch', live_count, movie_count, series_count))
+    print('  [6] {:<35} —  {}'.format('Convert', convert_status))
     print()
-    print('  [7] Settings           —  {}/{} done'.format(settings_done, settings_total))
-    print('  [8] Auth               —  {}/{} done'.format(auth_done, auth_total))
+    print('  [7] {:<35} —  {}/{} done'.format('Settings', settings_done, settings_total))
+    print('  [8] {:<35} —  {}/{} done'.format('Auth', auth_done, auth_total))
     print()
     print('-' * 60)
     print('  [B] Back')
@@ -1815,6 +1097,7 @@ def portal_show_hub(json_mgr):
 
 def portal_hub_loop(client, json_mgr, is_restored):
     """Main Hub loop."""
+    global _hub_full, _hub_pos
     if is_restored:
         print('  -> Session restored')
         time.sleep(0.3)
@@ -1825,6 +1108,24 @@ def portal_hub_loop(client, json_mgr, is_restored):
         choice = portal_show_hub(json_mgr)
         if choice == 'B':
             break
+        elif choice == '0':
+            _m0 = json_mgr.data.get('_meta', {})
+            _tmgr = JSONManager(_m0.get('portal', ''), _m0.get('mac', ''))
+            _clean_hub_memory(_tmgr)
+            clear_outcomes_memory(_tmgr)
+            _tmgr.set_transient(True)
+            try:
+                _hub_full = False
+                _hub_pos = 0
+                hub_loop(client, _tmgr, True)
+            finally:
+                _tmgr.set_transient(False)
+            _real = persist_failures_only(
+                _m0.get('portal', ''), _m0.get('mac', ''),
+                _tmgr.data.get('_meta', {}))
+            sync_outer_meta(json_mgr.data.setdefault('_meta', {}),
+                            _real.data.get('_meta', {}))
+            continue
         elif choice == '1':
             cat_codes = ['C2', 'D1', 'E1']
             all_done = all((json_mgr.is_done(c) for c in cat_codes))
@@ -1883,6 +1184,7 @@ def portal_run_section_submenu(client, json_mgr, sec_key, skip=None):
             progress = _step_progress(json_mgr, code)
             print('  [{}] {:<45} {}'.format(j + 1, desc, progress))
         print()
+        print('-' * 60)
         if len(visible_items) > 1:
             print('  [1-{}] Pick step  |  [B] Back'.format(len(visible_items)))
         else:
@@ -1917,6 +1219,7 @@ def portal_print_settings_submenu(json_mgr):
             mark = '[>]'
         print('  {} {:<50} {}'.format(mark, desc, info))
     print()
+    print('-' * 60)
     print('  [Enter] Continue next pending  |  [B] Back')
 
 def portal_run_settings_submenu(client, json_mgr):
@@ -1952,6 +1255,7 @@ def portal_run_convert_submenu(json_mgr):
     print('     Movies: {}'.format(files.get('movies', '')))
     print('     Series: {}'.format(files.get('series', '')))
     print()
+    print('-' * 60)
     print('  [R] Regenerate  |  [B] Back')
     choice = input('  > ').strip().upper()
     if choice == 'R':
@@ -1974,6 +1278,7 @@ def portal_show_watch_submenu(json_mgr):
     print('  [2] VOD Movies        —  {} movies'.format(movie_count))
     print('  [3] Series            —  {} series'.format(series_count))
     print()
+    print('-' * 60)
     print('  [B] Back')
 
 def portal_run_watch_submenu(json_mgr):
@@ -2078,6 +1383,7 @@ def portal_paginated_browse(items, title, headers, row_fmt_fn, page_size=20, get
         for i in range(start, end):
             print(row_fmt_fn(items[i], i + 1))
         print()
+        print('-' * 60)
         if get_urls_fn:
             if max_page > 0:
                 if page < max_page:
@@ -2186,67 +1492,6 @@ _hub_title_total = 0
 _hub_full = False
 
 
-_CONTENT_CODES = {"C2", "D1", "E1", "C5", "D4", "E5", "C4", "D3", "E4", "E3"}
-
-def _clean_hub_memory(json_mgr):
-    """Health-only fresh: clear live/vod/series content + content done markers,
-    keep every other _meta value (health score, handshake, history)."""
-    for section in ("live", "movies", "series"):
-        sec = json_mgr.data.get(section)
-        if isinstance(sec, dict):
-            sec["categories"] = []
-            for key in [k for k in sec
-                        if k.startswith(("_remaining", "_fetched", "_failed", "_probed"))]:
-                sec[key] = []
-    meta = json_mgr.data.get("_meta", {})
-    if isinstance(meta, dict):
-        done = meta.get("done_steps", [])
-        if isinstance(done, list):
-            meta["done_steps"] = [c for c in done if c not in _CONTENT_CODES]
-        ignored = meta.get("ignored_steps", [])
-        if isinstance(ignored, list):
-            meta["ignored_steps"] = [c for c in ignored if c not in _CONTENT_CODES]
-        if meta.get("last_step") in _CONTENT_CODES:
-            meta.pop("last_step", None)
-        meta.pop("scraped_at", None)
-
-
-def _fresh_session_file(portal, mac):
-    """Health-only clean of saved file: clear live/vod/series + content done
-    markers, keep _meta health/handshake/history and cache untouched."""
-    try:
-        session_id = make_session_id(portal, mac)
-        spath = os.path.join(SESSION_DIR, session_id + ".json")
-        if not os.path.exists(spath):
-            return
-        with open(spath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return
-        for section in ("live", "movies", "series"):
-            sec = data.get(section)
-            if isinstance(sec, dict):
-                sec["categories"] = []
-                for key in [k for k in sec
-                            if k.startswith(("_remaining", "_fetched", "_failed", "_probed"))]:
-                    sec[key] = []
-        meta = data.get("_meta", {})
-        if isinstance(meta, dict):
-            done = meta.get("done_steps", [])
-            if isinstance(done, list):
-                meta["done_steps"] = [c for c in done if c not in _CONTENT_CODES]
-            ignored = meta.get("ignored_steps", [])
-            if isinstance(ignored, list):
-                meta["ignored_steps"] = [c for c in ignored if c not in _CONTENT_CODES]
-            if meta.get("last_step") in _CONTENT_CODES:
-                meta.pop("last_step", None)
-            meta.pop("scraped_at", None)
-        with open(spath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
-
-
 def _run_one(portal, mac, idx, total):
     """Open one portal and run its hub. Fail and done both return here."""
     global _hub_title_idx, _hub_title_total
@@ -2269,41 +1514,13 @@ def _run_one(portal, mac, idx, total):
 
 
 def _run_one_portal(portal, mac):
-    """Open one portal in the portal hub: fresh window, handshake below it."""
+    """Open one portal in the portal hub: handshake already ran on the list."""
     json_mgr = JSONManager(portal, mac)
     meta = json_mgr.data.setdefault("_meta", {})
     if not meta.get("portal") or not meta.get("mac"):
         json_mgr.set_meta(portal, mac)
-    _clean_hub_memory(json_mgr)
     client = Mac2ListPortal(portal, mac)
-    portal_show_hub_header(json_mgr)
-    print()
-    print("  > ")
-    idx, _, desc, info, is_auto = get_step_info("A1")
-    if not run_single_step(client, json_mgr, "A1", desc, info, is_auto):
-        return
     portal_hub_loop(client, json_mgr, True)
-
-
-def _scan_again(session):
-    """Second-plus runs: everything reruns except dead handshakes.
-
-    Skipped only when the saved handshake failed with an HTTP 4xx code
-    or a connection failure. Timeouts, 5xx, no-token, half-done,
-    fully passed and never-scanned portals all run full again."""
-    meta = _session_meta(session)
-    if meta.get("handshake_status") == "failed":
-        reason = meta.get("handshake_reason", "") or ""
-        if reason == "connection":
-            return False
-        if reason.startswith("HTTP"):
-            try:
-                code = int(reason.split()[1])
-            except (IndexError, ValueError):
-                code = 0
-            if 400 <= code <= 499:
-                return False
-    return True
 
 
 def main():
@@ -2332,8 +1549,20 @@ def main():
                 continue
             _fresh_session_file(portal, mac)
             _register_new_portal(portal, mac)
-            _hub_full = False
-            _run_one(portal, mac, 1, 1)
+            while True:
+                mode, payload = run_resume_or_new()
+                if mode in ("BACK", "EMPTY"):
+                    break
+                if mode == "FULL":
+                    todo = [s for s in payload if _scan_again(s)]
+                    for i, session in enumerate(todo):
+                        _hub_full = True
+                        _run_one(session["portal"], session["mac"], i + 1, len(todo))
+                    _hub_full = False
+                else:
+                    _hub_full = False
+                    portal, mac, idx, total = payload
+                    _run_one_portal(portal, mac)
         elif choice == "2" and sessions:
             while True:
                 mode, payload = run_resume_or_new()
