@@ -461,17 +461,13 @@ def _resolve_items_list(client, json_mgr, step_code, items, title, action_type):
         else:
             print("  -> [OK] Resolved {}/{} items.".format(len(to_resolve), len(to_resolve)))
         if cache:
-            step_path = cache.step_path(step_code)
-            if step_path:
-                step_data = {
-                    "_status": "done",
-                    "_total_resolved": len(existing_responses),
-                    "_total_failed": fail_count,
-                    "responses": existing_responses
-                }
-                os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                with open(step_path, "w", encoding="utf-8") as f:
-                    json.dump(step_data, f, indent=2, ensure_ascii=False)
+            step_data = {
+                "_status": "done",
+                "_total_resolved": len(existing_responses),
+                "_total_failed": fail_count,
+                "responses": existing_responses
+            }
+            cache.write_step(step_code, step_data)
         time.sleep(0.5)
 
 
@@ -604,17 +600,13 @@ def _resolve_episodes(client, json_mgr, step_code):
             else:
                 print("  -> [OK] Resolved {}/{} episodes.".format(len(all_episodes), len(all_episodes)))
             if cache:
-                step_path = cache.step_path(step_code)
-                if step_path:
-                    step_data = {
-                        "_status": "done",
-                        "_total_resolved": len(existing_responses),
-                        "_total_failed": fail_count,
-                        "responses": existing_responses
-                    }
-                    os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                    with open(step_path, "w", encoding="utf-8") as f:
-                        json.dump(step_data, f, indent=2, ensure_ascii=False)
+                step_data = {
+                    "_status": "done",
+                    "_total_resolved": len(existing_responses),
+                    "_total_failed": fail_count,
+                    "responses": existing_responses
+                }
+                cache.write_step(step_code, step_data)
             time.sleep(0.5)
             selected_series = None
             continue
@@ -676,17 +668,13 @@ def _resolve_episodes(client, json_mgr, step_code):
         else:
             print("  -> [OK] Resolved {}/{} episodes.".format(len(episodes), len(episodes)))
         if cache:
-            step_path = cache.step_path(step_code)
-            if step_path:
-                step_data = {
-                    "_status": "done",
-                    "_total_resolved": len(existing_responses),
-                    "_total_failed": fail_count,
-                    "responses": existing_responses
-                }
-                os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                with open(step_path, "w", encoding="utf-8") as f:
-                    json.dump(step_data, f, indent=2, ensure_ascii=False)
+            step_data = {
+                "_status": "done",
+                "_total_resolved": len(existing_responses),
+                "_total_failed": fail_count,
+                "responses": existing_responses
+            }
+            cache.write_step(step_code, step_data)
         time.sleep(0.5)
         selected_series = None  # clear for next loop
 

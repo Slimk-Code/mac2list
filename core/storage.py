@@ -69,6 +69,14 @@ class CacheManager:
         self.session_id = session_id
         self.cache_root = os.path.join(CACHE_DIR, session_id)
         self.session_file = os.path.join(SESSION_DIR, f"{session_id}.json")
+        # Transient mode: memory-only, no file writes. Default off so all
+        # existing callers (including Mac2List-Simple) behave exactly as before.
+        self.transient = False
+
+    def set_transient(self, on=True):
+        """Enable/disable memory-only mode (no file writes)."""
+        self.transient = bool(on)
+        return self
 
     # ----------------------------------------------------------
     # Scaffold
@@ -119,6 +127,8 @@ class CacheManager:
         path = self.step_path(code)
         if not path:
             return
+        if self.transient:
+            return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -126,6 +136,8 @@ class CacheManager:
     def write_error(self, code, label, data):
         """Write an error dict to errors/<code>_<label>_ERROR.json."""
         path = self.error_path(code, label)
+        if self.transient:
+            return path
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -145,11 +157,15 @@ class CacheManager:
         return self.step_status(code) == "ignored"
 
     def mark_done(self, code):
+        if self.transient:
+            return
         data = self.load_step(code)
         data["_status"] = "done"
         self.write_step(code, data)
 
     def mark_ignored(self, code):
+        if self.transient:
+            return
         data = self.load_step(code)
         data["_status"] = "ignored"
         self.write_step(code, data)
@@ -159,6 +175,8 @@ class CacheManager:
     # ----------------------------------------------------------
     def save_session(self, data):
         """Write the consolidated JSON to data/session/<session_id>.json."""
+        if self.transient:
+            return
         os.makedirs(SESSION_DIR, exist_ok=True)
         with open(self.session_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -236,6 +254,15 @@ class JSONManager:
         self.filename = self.cache.session_file
         self.data = self.cache.merge_all()
         self._ensure_tracking()
+        # Transient mode: memory-only, no file writes. Default off so all
+        # existing callers (including Mac2List-Simple) behave exactly as before.
+        self.transient = False
+
+    def set_transient(self, on=True):
+        """Enable/disable memory-only mode on this manager and its cache."""
+        self.transient = bool(on)
+        self.cache.set_transient(self.transient)
+        return self
 
     def _ensure_tracking(self):
         for section, key in [
@@ -257,6 +284,8 @@ class JSONManager:
 
     def save(self):
         """Persist consolidated data to data/session/<session_id>.json."""
+        if self.transient:
+            return self.filename
         self.cache.save_session(self.data)
         return self.filename
 
@@ -478,6 +507,20 @@ class JSONManager:
         return self._get_tracked("series", "failed")
 
 # ============================================================
+# STEP OUTCOMES  (pure logic, no print/input/screen code)
+# ============================================================
+def save_step_outcome(json_mgr, key, ok, reason=""):
+    """Persist pass or failed plus reason for a hub row status."""
+    meta = json_mgr.data.setdefault("_meta", {})
+    meta[key + "_status"] = "pass" if ok else "failed"
+    if reason:
+        meta[key + "_reason"] = reason
+    else:
+        meta.pop(key + "_reason", None)
+    json_mgr.save()
+
+
+# ============================================================
 # RAW STEP SAVING
 # ============================================================
 def save_json(data, code, action_name, cache=None):
@@ -486,6 +529,8 @@ def save_json(data, code, action_name, cache=None):
     if not data:
         return None
     if cache:
+        if getattr(cache, "transient", False):
+            return "(memory)"
         path = cache.step_path(code)
         if path:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -518,6 +563,8 @@ def save_error_json(code, action_name, status, url, error_msg, lockedpath, cache
     if cache:
         # Write the error into errors/ dir AND mark the step file as error
         err_path = cache.write_error(code, action_name, error_data)
+        if getattr(cache, "transient", False):
+            return err_path
         step_path = cache.step_path(code)
         if step_path:
             with open(step_path, "w", encoding="utf-8") as f:
