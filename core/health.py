@@ -113,4 +113,8 @@ def run_check_links(client, json_mgr, progress=None):
             shutil.rmtree(dst_root)
         if os.path.isdir(src_root):
             shutil.move(src_root, dst_root)
+    for root in (os.path.join(OUTPUT_DIR, "dead"),
+                 os.path.join(OUTPUT_DIR, "success")):
+        if os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
     return alive > 0

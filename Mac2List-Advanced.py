@@ -45,7 +45,6 @@ from core.hub import (
     handshake_status,
     register_new_portal as _register_new_portal,
     reset_scrape_fail_reason,
-    row_counts as _row_counts,
     row_status as _row_status,
     run_handshake_step,
     run_step_work,
@@ -197,35 +196,7 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
         elif choice.isdigit():
             num = int(choice)
             if 1 <= num <= total:
-                picked = items[num - 1]
-                _paint_list()
-                print()
-                print()
-                _, _, _desc, _, _ = get_step_info("A1")
-                print("  Executing: A1 — {}".format(_desc))
-                print()
-                try:
-                    _mgr = JSONManager(picked.get("portal", ""), picked.get("mac", ""))
-                    _mmeta = _mgr.data.setdefault("_meta", {})
-                    if not _mmeta.get("portal") or not _mmeta.get("mac"):
-                        _mgr.set_meta(picked.get("portal", ""), picked.get("mac", ""))
-                    _client = Mac2ListPortal(picked.get("portal", ""), picked.get("mac", ""))
-                    _ok, _msg = run_handshake_step(_client, _mgr)
-                    print(_msg)
-                    if _ok:
-                        _mgr.mark_done("A1")
-                    time.sleep(3)
-                    print()
-                    print("  -> session saved")
-                    time.sleep(1)
-                except Exception as e:
-                    print("  -> [!] Handshake failed — {}.".format(e))
-                    _ok = False
-                    _cooldown(2)
-                if _ok:
-                    return picked
-                _cooldown(2)
-                continue
+                return items[num - 1]
 
 
 def _select_restore_session(sessions):
@@ -244,7 +215,7 @@ def _select_restore_session(sessions):
         return "  {:<4} {:<24} {:<19} {}".format(idx, portal, mac, status)
 
     sessions = sorted(sessions, key=_portal_rank)
-    picked = _select_paginated(sessions, "mac2list Scanner v1.2", header_line, row_fmt)
+    picked = _select_paginated(sessions, "Mac2List Advanced v1.2", header_line, row_fmt)
     return picked, sessions
 
 
@@ -254,25 +225,18 @@ def _select_restore_session(sessions):
 def _paint_top_menu(sessions):
     """Top screen paint without input."""
     clear_screen()
-    print("=" * 60)
-    print("   mac2list v1.2 - Advanced Scan")
-    print("=" * 60)
-    print()
-    print("  [1] New session")
-    print()
+    paint_header("Mac2List Advanced v1.2 - Advanced Scan")
+    paint_gap()
+    paint_rows(["  [1] New session"])
+    paint_gap()
     if sessions:
-        print("  [2] Restore session")
-        print("      {} saved".format(len(sessions)))
-        print()
-        for _ in range(1):
-            print()
-        print("-" * 60)
+        paint_rows(["  [2] Restore session",
+                    "      {} saved".format(len(sessions))])
+        paint_gap(2)
     else:
-        for _ in range(1):
-            print()
-        print("-" * 60)
-    print("  [Q] Quit")
-    print()
+        paint_gap()
+    paint_rows(["  [Q] Quit"])
+    paint_gap()
 
 
 def show_top_menu(sessions):
@@ -285,11 +249,9 @@ def _empty_list_shell():
     """List shell when the database is empty. Returns NEW, BACK or EMPTY."""
     def _paint_empty():
         clear_screen()
-        print("=" * 60)
-        print("   mac2list Scanner v1.2 — Page 1/1 — 0 saved")
-        print("=" * 60)
-        print()
-        print("  No saved sessions.")
+        paint_header("Mac2List Advanced v1.2 — Page 1/1 — 0 saved")
+        paint_gap()
+        paint_rows(["  No saved sessions."])
         paint_footer("  [N] New session  |  [Q] Quit")
 
     while True:
@@ -379,7 +341,7 @@ def show_hub_header(json_mgr):
     """Print hub header/menu without input prompt."""
     clear_screen()
     meta = json_mgr.data.get("_meta", {})
-    paint_header("mac2list Scanner v1.2 — {} — {}".format(
+    paint_header("Mac2List Advanced v1.2 — {} — {}".format(
         _domain_of(meta.get("portal", "")) or "Main Hub", meta.get("mac", "")))
     print()
     paint_caption('  #  {:<45} {}'.format('Item', 'Status'))
@@ -389,7 +351,7 @@ def show_hub_header(json_mgr):
     print()
     paint_rows(['  {} {:<45} {}'.format(">>" if _hub_pos == 2 else "  ", _side_label("Vod", json_mgr, "D4", "D3"), _side_status(json_mgr, "scrape_movies", "D4", "D3"))])
     print()
-    paint_rows(['  {} {:<45} {}'.format(">>" if _hub_pos == 3 else "  ", "Health Checker ({}/{})".format(*_row_counts(json_mgr, "CHK")), _row_status(json_mgr, "CHK"))])
+    paint_rows(['  {} {:<45} {}'.format(">>" if _hub_pos == 3 else "  ", "Health Checker", _row_status(json_mgr, "CHK"))])
     if _hub_full:
         paint_footer("  {} out of {}".format(_hub_title_idx, _hub_title_total))
     else:
@@ -988,16 +950,14 @@ def portal_run_resolve_step_auto(client, json_mgr, step_code):
 def portal_show_resume_menu(sessions, reveal_new=False, portal='', mac=''):
     """Display landing page. If reveal_new=True, show Portal/MAC inputs inline."""
     portal_clear_screen()
-    print('=' * 60)
-    print('   mac2list v1.2')
-    print('=' * 60)
-    print()
+    paint_header('Mac2List Advanced v1.2')
+    paint_gap()
     if sessions:
-        print('  [1] Restore session')
-        print('      {} saved'.format(len(sessions)))
-        print()
+        paint_rows(['  [1] Restore session',
+                    '      {} saved'.format(len(sessions))])
+        paint_gap()
     next_num = 2 if sessions else 1
-    print('  [{}] New session'.format(next_num))
+    paint_rows(['  [{}] New session'.format(next_num)])
     if reveal_new:
         print()
         if portal:
@@ -1010,9 +970,9 @@ def portal_show_resume_menu(sessions, reveal_new=False, portal='', mac=''):
             mac = input('      MAC Address: ').strip()
         if portal and mac:
             return ('', portal, mac)
-    print()
-    print('  [Q] Quit')
-    print()
+    paint_gap()
+    paint_rows(['  [Q] Quit'])
+    paint_gap()
     return (input('  > ').strip().upper(), portal, mac)
 
 def portal__select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
@@ -1023,23 +983,17 @@ def portal__select_paginated(items, title, header_line, row_fmt_fn, page_size=20
     max_page = (total - 1) // page_size
     while True:
         portal_clear_screen()
-        print('=' * 60)
-        print('   {} — Page {}/{} — {} saved'.format(title, page + 1, max_page + 1, total))
-        print('=' * 60)
-        print()
-        print(header_line)
-        print('  ' + '-' * 64)
+        paint_header('{} — Page {}/{} — {} saved'.format(title, page + 1, max_page + 1, total))
+        paint_gap()
+        paint_caption(header_line)
         start = page * page_size
         end = min(start + page_size, total)
-        for i in range(start, end):
-            print(row_fmt_fn(items[i], i + 1))
-        print()
-        print('-' * 60)
+        paint_rows([row_fmt_fn(items[i], i + 1) for i in range(start, end)])
         if max_page > 0:
-            print('  [Enter] Next page  |  [1-{}] Restore  |  [B] Back'.format(total))
+            paint_footer('  [Enter] Next page  |  [1-{}] Restore  |  [B] Back'.format(total))
         else:
-            print('  [1-{}] Restore  |  [B] Back'.format(total))
-        choice = input('  > ').strip().upper()
+            paint_footer('  [1-{}] Restore  |  [B] Back'.format(total))
+        choice = input().strip().upper()
         if choice == 'B':
             return None
         elif choice == '' and max_page > 0:
@@ -1114,7 +1068,7 @@ def portal_run_resume_or_new():
 def portal_show_hub_header(json_mgr):
     """Print hub header/menu without input prompt."""
     portal_clear_screen()
-    paint_header('mac2list v1.2 — Main Hub')
+    paint_header('Mac2List Advanced v1.2 — Portal Scanner')
     print()
     paint_caption('  [#] {:<35}   {}'.format('Item', 'Status'))
     paint_rows(['  [0] {:<35}   {}'.format(
@@ -1153,12 +1107,6 @@ def portal_show_hub(json_mgr):
 def portal_hub_loop(client, json_mgr, is_restored):
     """Main Hub loop."""
     global _hub_full, _hub_pos
-    if is_restored:
-        print('  -> Session restored')
-        time.sleep(0.3)
-    else:
-        print('  -> New session started')
-        time.sleep(0.3)
     while True:
         choice = portal_show_hub(json_mgr)
         if choice == 'B':
@@ -1182,6 +1130,21 @@ def portal_hub_loop(client, json_mgr, is_restored):
                             _real.data.get('_meta', {}))
             continue
         elif choice == '1':
+            if not json_mgr.is_done('A1'):
+                _, _, _desc, _, _ = get_step_info('A1')
+                print()
+                print('  Executing: A1 — {}'.format(_desc))
+                print()
+                _ok, _msg = run_handshake_step(client, json_mgr)
+                print(_msg)
+                if _ok:
+                    json_mgr.mark_done('A1')
+                time.sleep(3)
+                print()
+                print('  -> session saved')
+                if not _ok:
+                    portal__cooldown()
+                    continue
             cat_codes = ['C2', 'D1', 'E1']
             all_done = all((json_mgr.is_done(c) for c in cat_codes))
             if all_done:
@@ -1240,7 +1203,10 @@ def portal_run_section_submenu(client, json_mgr, sec_key, skip=None):
     visible_items = [(c, d, i, a) for c, d, i, a in sec['items'] if c not in skip]
     while True:
         portal_clear_screen()
-        paint_header('{}'.format(sec['title']))
+        if sec_key == 'Live Channels':
+            paint_header('Mac2List Advanced v1.2 — Live Channels')
+        else:
+            paint_header('{}'.format(sec['title']))
         print()
         paint_caption('  [#] {:<45} {}'.format('Item', 'Status'))
         paint_rows(['  [{}] {:<45} {}'.format(j + 1, desc, _step_progress(json_mgr, code))
@@ -1296,20 +1262,16 @@ def portal_run_settings_submenu(client, json_mgr):
 def portal_run_convert_submenu(json_mgr):
     """Convert action."""
     portal_clear_screen()
-    print('=' * 60)
-    print('   Convert')
-    print('=' * 60)
-    print()
+    paint_header('Convert')
+    paint_gap()
     files = generate_m3u(json_mgr)
     json_mgr.mark_done('G1')
-    print('  -> [OK] M3U files generated:')
-    print('     Live:   {}'.format(files.get('live', '')))
-    print('     Movies: {}'.format(files.get('movies', '')))
-    print('     Series: {}'.format(files.get('series', '')))
-    print()
-    print('-' * 60)
-    print('  [R] Regenerate  |  [B] Back')
-    choice = input('  > ').strip().upper()
+    paint_rows(['  -> [OK] M3U files generated:',
+                '     Live:   {}'.format(files.get('live', '')),
+                '     Movies: {}'.format(files.get('movies', '')),
+                '     Series: {}'.format(files.get('series', ''))])
+    paint_footer('  [R] Regenerate  |  [B] Back')
+    choice = input().strip().upper()
     if choice == 'R':
         files = generate_m3u(json_mgr)
         print('  -> [OK] Regenerated:')
