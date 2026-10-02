@@ -57,11 +57,7 @@ def fetch_single_category(client, json_mgr, section, cat_id):
         if cache:
             step_code = {"live": "C5", "movies": "D4", "series": "E5"}.get(section)
             if step_code:
-                step_path = cache.step_path(step_code)
-                if step_path:
-                    os.makedirs(os.path.dirname(step_path), exist_ok=True)
-                    with open(step_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
+                cache.write_step(step_code, data)
 
         js = data.get("js", {})
         if isinstance(js, dict):
@@ -174,15 +170,11 @@ def fetch_episodes(client, json_mgr, series_items, existing_responses=None, prog
     # Persist the E3 step file
     cache = getattr(json_mgr, "cache", None)
     if cache:
-        step_path = cache.step_path("E3")
-        if step_path:
-            step_data = {
-                "_status": "done",
-                "_total_fetched": len(existing_responses),
-                "_total_failed": fail_count,
-                "responses": existing_responses
-            }
-            os.makedirs(os.path.dirname(step_path), exist_ok=True)
-            with open(step_path, "w", encoding="utf-8") as f:
-                json.dump(step_data, f, indent=2, ensure_ascii=False)
+        step_data = {
+            "_status": "done",
+            "_total_fetched": len(existing_responses),
+            "_total_failed": fail_count,
+            "responses": existing_responses
+        }
+        cache.write_step("E3", step_data)
     return ok_count, fail_count

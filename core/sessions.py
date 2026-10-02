@@ -35,7 +35,8 @@ def _write_json(path, data):
 
 
 def read_database():
-    """Return flat list of {portal, mac} entries from data/database.json.
+    """Return flat list of {portal, mac, kind} entries from data/database.json.
+    Active and pending MACs are listed; archived MACs are skipped.
     Empty list when the database file is missing or corrupt."""
     data = _read_json(DATABASE_FILE)
     if not data or not isinstance(data, dict):
@@ -48,14 +49,14 @@ def read_database():
         if not isinstance(group, dict) or not group.get("portal"):
             continue
         portal = group["portal"]
-        macs = group.get("macs")
-        if not isinstance(macs, list):
-            continue
-        for m in macs:
-            if isinstance(m, str) and m:
-                entries.append({"portal": portal, "mac": m})
-            elif isinstance(m, dict) and m.get("mac"):
-                entries.append({"portal": portal, "mac": m["mac"]})
+        active = group.get("active_mac", "")
+        if isinstance(active, str) and active:
+            entries.append({"portal": portal, "mac": active, "kind": "active"})
+        pending = group.get("pending_macs") or []
+        if isinstance(pending, list):
+            for m in pending:
+                if isinstance(m, str) and m:
+                    entries.append({"portal": portal, "mac": m, "kind": "pending"})
     return entries
 
 
@@ -74,30 +75,36 @@ def database_sessions():
             "portal": e["portal"],
             "mac": e["mac"],
             "phone": phone,
+            "kind": e.get("kind", "active"),
         })
     return sessions
 
 
 def register_session(portal, mac):
-    """Add or refresh a portal+MAC entry in data/database.json (creates the
-    file the first time a new session is made). One portal holds its MACs."""
+    """Add a portal+MAC entry in data/database.json (creates the
+    file the first time a new session is made). Unknown MACs land in
+    pending_macs: visible but locked, never auto-scanned."""
     data = _read_json(DATABASE_FILE)
     if not data or not isinstance(data, dict):
         data = {"portals": []}
     portals = data.get("portals")
     if not isinstance(portals, list):
         portals = []
+        data["portals"] = portals
     group = next((g for g in portals if isinstance(g, dict) and g.get("portal") == portal), None)
     if group is None:
-        group = {"portal": portal, "macs": []}
+        group = {"portal": portal, "active_mac": "", "pending_macs": [], "Archive_mac": []}
         portals.append(group)
-    macs = group.get("macs")
-    if not isinstance(macs, list):
-        macs = []
-        group["macs"] = macs
-    if mac not in macs:
-        macs.append(mac)
-    data["portals"] = portals
+    if group.get("active_mac") == mac:
+        return
+    if mac in (group.get("Archive_mac") or []):
+        return
+    pending = group.get("pending_macs")
+    if not isinstance(pending, list):
+        pending = []
+        group["pending_macs"] = pending
+    if mac not in pending:
+        pending.append(mac)
     _write_json(DATABASE_FILE, data)
 
 
