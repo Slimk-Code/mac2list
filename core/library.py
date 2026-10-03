@@ -15,7 +15,7 @@ from .storage import save_step_outcome
 
 def fetch_all_live_no_viewer(client, json_mgr, progress=None):
     """Fetch 1st page of every pending live category first,
-    then filter the entire set at once and keep the first 100.
+    then filter the entire set at once and keep the first 50.
 
     progress(done, total) is called after each category.
     Returns True on success.
@@ -52,16 +52,16 @@ def fetch_all_live_no_viewer(client, json_mgr, progress=None):
         save_step_outcome(json_mgr, "fetch_live",
                            False, fetch_reason(first_error) if first_error is not None else "unknown")
         return False
-    # Phase 2: filter the entire set at once, keep first 100
+    # Phase 2: filter the entire set at once, keep first 50
     kept = [(cid, it) for cid, items in collected for it in items
             if channel_name_ok(it.get("name", it.get("title", "")))]
-    kept = kept[:100]
-    if len(kept) < 100:
+    kept = kept[:50]
+    if len(kept) < 50:
         kept_ids = set(id(it) for _, it in kept)
         clean = [(cid, it) for cid, items in collected for it in items
                  if channel_name_clean(it.get("name", it.get("title", "")))
                  and id(it) not in kept_ids]
-        kept = kept + clean[:100 - len(kept)]
+        kept = kept + clean[:50 - len(kept)]
     # Phase 3: save grouped by category
     by_cat = {}
     for cid, it in kept:
@@ -82,7 +82,7 @@ def fetch_all_live_no_viewer(client, json_mgr, progress=None):
 
 def fetch_all_movies_no_viewer(client, json_mgr, progress=None):
     """Fetch 1st page of every pending VOD category first,
-    then filter the entire set at once and keep the first 100.
+    then filter the entire set at once and keep the first 50.
 
     progress(done, total) is called after each category.
     Returns True on success.
@@ -120,16 +120,16 @@ def fetch_all_movies_no_viewer(client, json_mgr, progress=None):
         save_step_outcome(json_mgr, "fetch_movies",
                            False, fetch_reason(first_error) if first_error is not None else "unknown")
         return False
-    # Phase 2: filter the entire set at once, keep first 100
+    # Phase 2: filter the entire set at once, keep first 50
     kept = [(cid, it) for cid, items in collected for it in items
             if movie_title_ok(it.get("name", it.get("title", "")))]
-    kept = kept[:100]
-    if len(kept) < 100:
+    kept = kept[:50]
+    if len(kept) < 50:
         kept_ids = set(id(it) for _, it in kept)
         clean = [(cid, it) for cid, items in collected for it in items
                  if not movie_title_ok(it.get("name", it.get("title", "")))
                  and id(it) not in kept_ids]
-        kept = kept + clean[:100 - len(kept)]
+        kept = kept + clean[:50 - len(kept)]
     # Phase 3: save grouped by category
     by_cat = {}
     for cid, it in kept:
@@ -265,6 +265,93 @@ def resolve_all_no_viewer(client, json_mgr, step_code, section, bucket, action_t
     else:
         save_step_outcome(json_mgr, rkey, True)
     return True, False
+
+
+def split_pending_resolved(items, key="resolved_url"):
+    """Split items into (pending, resolved, ordered) by presence of key."""
+    pending = [it for it in items if not it.get(key)]
+    resolved = [it for it in items if it.get(key)]
+    return pending, resolved, pending + resolved
+
+
+def collect_series_items(json_mgr):
+    """All series items across categories."""
+    items = []
+    for cat in json_mgr.data.get("series", {}).get("categories", []):
+        for item in cat.get("items", []):
+            items.append(item)
+    return items
+
+
+def collect_series_with_episodes(json_mgr):
+    """Series items that have seasons with episodes."""
+    items = []
+    for cat in json_mgr.data.get("series", {}).get("categories", []):
+        for s in cat.get("items", []):
+            seasons = s.get("seasons", [])
+            if seasons and any(season.get("episodes") for season in seasons):
+                items.append(s)
+    return items
+
+
+def collect_live_items(json_mgr):
+    """All live channels across categories."""
+    items = []
+    for cat in json_mgr.data.get("live", {}).get("categories", []):
+        for ch in cat.get("channels", []):
+            items.append(ch)
+    return items
+
+
+def collect_movie_items(json_mgr):
+    """All VOD movies across categories."""
+    items = []
+    for cat in json_mgr.data.get("movies", {}).get("categories", []):
+        for m in cat.get("items", []):
+            items.append(m)
+    return items
+
+
+def is_series_resolved(series):
+    """True when any season has a resolved_ep_ key."""
+    for season in series.get("seasons", []):
+        for key in season:
+            if key.startswith("resolved_ep_"):
+                return True
+    return False
+
+
+def flatten_all_episodes(pending_series):
+    """Flatten pending series seasons into episode dicts."""
+    all_episodes = []
+    for s in pending_series:
+        for season in s.get("seasons", []):
+            s_name = season.get("name", "Unknown")
+            s_cmd = season.get("cmd", "")
+            for ep_num in season.get("episodes", []):
+                all_episodes.append({
+                    "season_name": s_name,
+                    "episode_num": ep_num,
+                    "cmd": s_cmd,
+                    "series_name": s.get("name", "Unknown"),
+                    "series_obj": s,
+                })
+    return all_episodes
+
+
+def flatten_series_episodes(series):
+    """Flatten one series seasons into episode dicts."""
+    episodes = []
+    for season in series.get("seasons", []):
+        season_name = season.get("name", "Unknown")
+        season_cmd = season.get("cmd", "")
+        for ep_num in season.get("episodes", []):
+            episodes.append({
+                "season_name": season_name,
+                "episode_num": ep_num,
+                "cmd": season_cmd,
+            })
+    return episodes
 
 
 def resolve_items_batch(client, json_mgr, step_code, items, action_type, progress=None):

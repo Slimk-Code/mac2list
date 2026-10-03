@@ -60,3 +60,51 @@ def paint_work_head(exec_line):
     print()
     print(exec_line)
     print()
+
+
+def clear_screen():
+    """Clear the terminal screen."""
+    import os as _os
+    _os.system("cls" if _os.name == "nt" else "clear")
+
+
+def cooldown(seconds=3):
+    """Simple pause."""
+    import time as _time
+    _time.sleep(seconds)
+
+
+def countdown(seconds=5):
+    """Visible countdown pause."""
+    import sys as _sys
+    import time as _time
+    for i in range(seconds, 0, -1):
+        _sys.stdout.write('\r  Continuing in {}s...  '.format(i))
+        _sys.stdout.flush()
+        _time.sleep(1)
+    _sys.stdout.write('\r' + ' ' * 40 + '\r')
+    _sys.stdout.flush()
+
+
+def progress_bar(current, total, prefix="", width=30):
+    """Single-line progress bar."""
+    import sys as _sys
+    if total <= 0:
+        pct = 100.0
+        filled = width
+    else:
+        pct = (current / total) * 100
+        filled = int(width * current / total)
+    bar = "=" * filled + "-" * (width - filled)
+    line = "{}[{}] {:5.1f}% ({}/{})".format(prefix, bar, pct, current, total)
+    _sys.stdout.write(chr(13) + line.ljust(80))
+    _sys.stdout.flush()
+    if current >= total:
+        print()
+
+
+def clear_batch_counter():
+    """Erase the current batch counter line."""
+    import sys as _sys
+    _sys.stdout.write(chr(13) + " " * 80 + chr(13))
+    _sys.stdout.flush()

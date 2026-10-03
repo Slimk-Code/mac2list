@@ -4,6 +4,7 @@
 # ============================================================
 import json
 import os
+from datetime import datetime
 
 from .config import SESSION_DIR
 from .sessions import make_session_id
@@ -116,34 +117,16 @@ def health_status(meta):
 
 
 def portal_rank(session):
-    """Sort key follows the displayed status: fresh, health 100,
-    health percent desc, HTTP asc, timeout, no channel, No category,
-    Broken data, No Data, handshake errors last. All MACs equal."""
-    status = portal_status(session)
-    if status == "-":
-        return (0, 0, 0)
-    if status == "success" or status == "health score - 100%":
-        return (1, 0, 0)
-    if status.startswith("health score - "):
-        try:
-            pct = int(status.rsplit("-", 1)[1].strip().rstrip("%"))
-        except (IndexError, ValueError):
-            pct = 0
-        return (2, -pct, 0)
-    if status.startswith("HTTP"):
-        try:
-            code = int(status.split()[1])
-        except (IndexError, ValueError):
-            code = 999
-        return (3, code, 0)
-    if status == "timeout":
-        return (4, 0, 0)
-    if status == "No channel":
-        return (5, 0, 0)
-    if status == "No category":
-        return (6, 0, 0)
-    if status == "Broken data":
-        return (7, 0, 0)
-    if status == "No Data":
-        return (8, 0, 0)
-    return (9, 0, 0)
+    """Sort key follows the expiry date: latest expiry on top, then
+    scraped-but-dateless ('unknown'), then never scraped ('-')."""
+    if portal_status(session) == "-":
+        return (2, 0, 0)
+    try:
+        ts = int(datetime.strptime(
+            str(session.get("phone", "")).strip(),
+            "%B %d, %Y, %I:%M %p").timestamp())
+    except Exception:
+        ts = 0
+    if ts:
+        return (0, -ts, 0)
+    return (1, 0, 0)

@@ -69,9 +69,10 @@ class CacheManager:
         self.session_id = session_id
         self.cache_root = os.path.join(CACHE_DIR, session_id)
         self.session_file = os.path.join(SESSION_DIR, f"{session_id}.json")
-        # Transient mode: memory-only, no file writes. Default off so all
-        # existing callers (including Mac2List-Simple) behave exactly as before.
-        self.transient = False
+        # No cache files are created anymore. Step-file writes are always
+        # skipped; only the consolidated session file is persisted.
+        # Transient mode additionally pauses session-file writes (for [0]).
+        self.transient = True
 
     def set_transient(self, on=True):
         """Enable/disable memory-only mode (no file writes)."""
@@ -82,17 +83,12 @@ class CacheManager:
     # Scaffold
     # ----------------------------------------------------------
     def scaffold(self):
-        """Create all directories and initialise missing step files to pending."""
+        """No-op: cache step files are no longer created.
+
+        Only ensures the session directory exists so the consolidated
+        session file can be saved. Never touches cache_root."""
         os.makedirs(SESSION_DIR, exist_ok=True)
-        os.makedirs(self.cache_root, exist_ok=True)
-        for sub in self._SUBDIRS:
-            os.makedirs(os.path.join(self.cache_root, sub), exist_ok=True)
-        # Initialise every step file if not present
-        for code, rel_path in STEP_FILE_MAP.items():
-            full = os.path.join(self.cache_root, rel_path)
-            if not os.path.exists(full):
-                with open(full, "w", encoding="utf-8") as f:
-                    json.dump({"_status": "pending"}, f, indent=2)
+        return
 
     # ----------------------------------------------------------
     # Step paths
@@ -174,12 +170,31 @@ class CacheManager:
     # Consolidated session file
     # ----------------------------------------------------------
     def save_session(self, data):
-        """Write the consolidated JSON to data/session/<session_id>.json."""
-        if self.transient:
-            return
+        """Write the consolidated JSON to data/session/<session_id>.json.
+
+        Session history is kept; only cache step files are disabled.
+        Only needed keys are persisted."""
+        data.pop("profile", None)
+        meta = data.get("_meta", {})
+        if isinstance(meta, dict):
+            data["_meta"] = {k: meta[k] for k in (
+                "created", "portal", "mac", "username", "password",
+                "done_steps", "ignored_steps",
+                "scraped_at", "check_alive", "check_total", "check_live_alive",
+                "check_vod_alive", "check_status", "check_reason",
+                "handshake_status", "handshake_reason", "scrape_status",
+                "scrape_reason", "scrape_live_status", "scrape_live_reason",
+                "scrape_movies_status", "scrape_movies_reason",
+                "fetch_live_status", "fetch_live_reason",
+                "fetch_movies_status", "fetch_movies_reason",
+                "resolve_live_status", "resolve_live_reason",
+                "resolve_movies_status", "resolve_movies_reason",
+            ) if k in meta}
         os.makedirs(SESSION_DIR, exist_ok=True)
         with open(self.session_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump({k: data[k] for k in (
+                "_meta", "account", "live", "movies", "series",
+            ) if k in data}, f, indent=2, ensure_ascii=False)
 
     def load_session(self):
         """Return the consolidated session dict, or None if not found."""
@@ -211,12 +226,10 @@ class CacheManager:
                 "created": datetime.now().isoformat(),
                 "portal": "",
                 "mac": "",
-                "last_step": "",
                 "scraped_at": "",
                 "ignored_steps": [],
                 "done_steps": []
             },
-            "profile": {},
             "account": {},
             "live": {"total_channels": 0, "grand_total": 0, "categories": []},
             "movies": {"total_items": 0, "grand_total": 0, "categories": []},
@@ -254,14 +267,17 @@ class JSONManager:
         self.filename = self.cache.session_file
         self.data = self.cache.merge_all()
         self._ensure_tracking()
-        # Transient mode: memory-only, no file writes. Default off so all
-        # existing callers (including Mac2List-Simple) behave exactly as before.
+        # Cache step files are never created (cache stays transient).
+        # self.transient=False keeps consolidated session-file saves on.
         self.transient = False
+        self.cache.set_transient(True)
 
     def set_transient(self, on=True):
-        """Enable/disable memory-only mode on this manager and its cache."""
+        """Enable/disable memory-only mode for session-file writes.
+
+        Cache step files stay disabled in both modes."""
         self.transient = bool(on)
-        self.cache.set_transient(self.transient)
+        self.cache.set_transient(True)
         return self
 
     def _ensure_tracking(self):

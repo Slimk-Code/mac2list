@@ -7,7 +7,7 @@ import copy
 import json
 import os
 
-from .config import CACHE_DIR, DATABASE_FILE, SESSION_DIR
+from .config import SESSION_DIR
 from .engine import get_step_info, run_auto_fetch_step
 from .library import (
     fetch_all_movies_no_viewer,
@@ -259,41 +259,14 @@ def side_label(name, json_mgr, fetch_code, resolve_code):
 
 
 def register_new_portal(portal, mac):
-    """Register a fresh portal with its first MAC active.
-
-    register_session files newcomers under pending_macs, matching the
-    conversion rule that only the first MAC is active. A group created
-    by this very call therefore gets its MAC moved to active_mac, so a
-    brand-new portal never shows up locked."""
-    try:
-        with open(DATABASE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        known = isinstance(data, dict) and any(
-            isinstance(g, dict) and g.get("portal") == portal
-            for g in data.get("portals", []) or [])
-    except Exception:
-        known = False
+    """Register a portal+MAC in the macs[] list."""
     _register_session(portal, mac)
-    if known:
-        return
-    try:
-        with open(DATABASE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return
-        for group in data.get("portals", []) or []:
-            if isinstance(group, dict) and group.get("portal") == portal:
-                if not group.get("active_mac"):
-                    pending = group.get("pending_macs") or []
-                    if mac in pending:
-                        pending.remove(mac)
-                    group["active_mac"] = mac
-                    group["pending_macs"] = pending
-                break
-        with open(DATABASE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+
+
+def register_new_xtream(portal, username, password=""):
+    """Register an Xtream login in the users[] list."""
+    from .sessions import register_xtream as _register_xtream
+    _register_xtream(portal, username, password)
 
 
 def scan_again(session):

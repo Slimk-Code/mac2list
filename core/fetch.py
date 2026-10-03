@@ -32,6 +32,23 @@ def category_status(json_mgr, section):
     return cats, pending, fetched_list, failed_list
 
 
+SECTION_TITLES = {
+    "live": "Fetch Channels",
+    "movies": "VOD Categories",
+    "series": "Series Categories",
+}
+
+
+def ordered_categories(json_mgr, section):
+    """Pending-first category ordering for pickers.
+
+    Returns (title, all_cats, pending, fetched_list, failed_list, cats)."""
+    title = SECTION_TITLES.get(section, section)
+    all_cats, pending, fetched_list, failed_list = category_status(json_mgr, section)
+    cats = pending + fetched_list + failed_list
+    return title, all_cats, pending, fetched_list, failed_list, cats
+
+
 # ============================================================
 # CATEGORY BATCH FETCH  (menu 2/3/4 — fetch items)
 # ============================================================

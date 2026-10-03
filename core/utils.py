@@ -37,6 +37,18 @@ def is_valid_mac(mac):
     return bool(re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac))
 
 
+def parse_numbers(choice, total):
+    """Parse a comma/space separated list of row numbers (1..total)."""
+    nums = []
+    for part in re.split(r'[,\s]+', choice or ""):
+        part = part.strip()
+        if part.isdigit():
+            n = int(part)
+            if 1 <= n <= total:
+                nums.append(n)
+    return nums
+
+
 def domain_of(url):
     """Return the domain of a portal URL, without scheme, path or port."""
     if not url:
