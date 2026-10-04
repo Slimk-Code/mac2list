@@ -939,7 +939,26 @@ def portal_hub_loop(client, json_mgr, is_restored, first_choice=None):
         if choice == 'B':
             break
         elif choice == '1':
-            _quick = input('  Quick scan to check if your portal is healthy? [Y/n] > ').strip().upper()
+            portal_show_hub_header(json_mgr)
+            print()
+            cat_codes = ['C2', 'D1', 'E1']
+            all_done = all((json_mgr.is_done(c) for c in cat_codes))
+            if all_done:
+                portal_show_hub_header(json_mgr)
+                print()
+                print()
+                ans = input('  Portal Already scraped. do you want to Re-scrape? [y/n] > ').strip().upper()
+                if ans != 'Y':
+                    continue
+                for c in cat_codes:
+                    if json_mgr.is_done(c):
+                        done = json_mgr.data['_meta'].get('done_steps', [])
+                        if c in done:
+                            done.remove(c)
+                            json_mgr.data['_meta']['done_steps'] = done
+                json_mgr.data['_meta']['scraped_at'] = ''
+                json_mgr.save()
+            _quick = input('\n  do you want to scan the health of your portal before scraping?  [y/n] > ').strip().upper()
             print()
             if _quick in ('', 'Y'):
                 _m0 = json_mgr.data.get('_meta', {})
@@ -984,24 +1003,6 @@ def portal_hub_loop(client, json_mgr, is_restored, first_choice=None):
                 portal_show_hub_header(json_mgr)
                 print()
                 portal_run_single_step(client, json_mgr, 'B1', _bdesc, _binfo, True)
-            cat_codes = ['C2', 'D1', 'E1']
-            all_done = all((json_mgr.is_done(c) for c in cat_codes))
-            if all_done:
-                portal_show_hub_header(json_mgr)
-                print()
-                print()
-                print('  Already scraped.')
-                ans = input('  Re-scrape? [Y/N] > ').strip().upper()
-                if ans != 'Y':
-                    continue
-                for c in cat_codes:
-                    if json_mgr.is_done(c):
-                        done = json_mgr.data['_meta'].get('done_steps', [])
-                        if c in done:
-                            done.remove(c)
-                            json_mgr.data['_meta']['done_steps'] = done
-                json_mgr.data['_meta']['scraped_at'] = ''
-                json_mgr.save()
             while True:
                 next_code = get_next_pending_step(json_mgr, cat_codes)
                 if next_code is None:
