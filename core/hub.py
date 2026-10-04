@@ -390,7 +390,8 @@ def persist_failures_only(portal, mac, post_meta):
 
     Strips old scrape/fetch/resolve outcomes, then applies every failed
     outcome (with reasons) plus the check result either way (pass with
-    counts, or failed with counts). Handshake state is preserved as-is.
+    counts, or failed with counts). A failed handshake is also copied;
+    a passing one never overwrites the stored state.
     Content passes are never written, so the next open starts empty while
     health score and errors used by the main list survive. Saved scrape
     content is untouched.
@@ -414,6 +415,10 @@ def persist_failures_only(portal, mac, post_meta):
             reason = key[:-len("_status")] + "_reason"
             if reason in post_meta:
                 rmeta[reason] = copy.deepcopy(post_meta[reason])
+    if isinstance(post_meta, dict) and post_meta.get("handshake_status") == "failed":
+        rmeta["handshake_status"] = "failed"
+        if "handshake_reason" in post_meta:
+            rmeta["handshake_reason"] = copy.deepcopy(post_meta["handshake_reason"])
     if post_meta.get("check_status") == "pass":
         rmeta["check_status"] = "pass"
         for key in CHECK_COUNT_KEYS:
@@ -434,7 +439,8 @@ def sync_outer_meta(outer_meta, real_meta):
     """Refresh an open manager's _meta from persisted file meta after [0].
 
     Drops old content outcomes plus check state, then copies failures and
-    the check result either way. Handshake state is preserved as-is.
+    the check result either way. A failed handshake is also copied; a
+    passing one never overwrites the stored state.
     """
     _STRIP = tuple(k for k in OUTCOME_STATUS_KEYS if not k.startswith("handshake"))
     for key in _STRIP:
@@ -450,6 +456,10 @@ def sync_outer_meta(outer_meta, real_meta):
             reason = key[:-len("_status")] + "_reason"
             if reason in real_meta:
                 outer_meta[reason] = copy.deepcopy(real_meta[reason])
+    if real_meta.get("handshake_status") == "failed":
+        outer_meta["handshake_status"] = "failed"
+        if "handshake_reason" in real_meta:
+            outer_meta["handshake_reason"] = copy.deepcopy(real_meta["handshake_reason"])
     if real_meta.get("check_status") in ("pass", "failed"):
         outer_meta["check_status"] = real_meta["check_status"]
         if "check_reason" in real_meta:
