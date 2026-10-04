@@ -223,13 +223,7 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=15):
             if 1 <= num <= total:
                 picked = items[num - 1]
                 if _session_meta(picked).get("check_status") is not None:
-                    _paint_list()
-                    print()
-                    print()
-                    ans = input("  Already scanned. do you want to Re-scan? [y/n] > ").strip().upper()
-                    print()
-                    if ans != "Y":
-                        return picked
+                    return picked
                 _client = Mac2ListPortal(picked["portal"], picked["mac"])
                 _tmgr = JSONManager(picked["portal"], picked["mac"])
                 _tmgr.set_meta(picked["portal"], picked["mac"])
@@ -477,14 +471,27 @@ def hub_loop(client, json_mgr, is_restored, quiet=False, frame=None):
         elif code == "CHECK":
             repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
             ok = run_single_step(client, json_mgr, "CHK", "Health Checker", "", False, quiet)
+            if ok and json_mgr.data.get("_meta", {}).get("check_status") != "failed":
+                if not (json_mgr.data.get("account") or {}).get("phone"):
+                    _, _, bdesc, binfo, _ = get_step_info("B1")
+                    repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
+                    run_single_step(client, json_mgr, "B1", bdesc, binfo, True, quiet)
+                    try:
+                        _phone = (json_mgr.data.get("account") or {}).get("phone", "")
+                        _meta = json_mgr.data.get("_meta", {})
+                        if _phone and getattr(json_mgr, "transient", False) and _meta.get("portal") and _meta.get("mac"):
+                            _real = JSONManager(_meta.get("portal"), _meta.get("mac"))
+                            _real.data["account"] = dict(json_mgr.data.get("account", {}))
+                            _real.save()
+                            if frame is not None and quiet:
+                                frame()
+                                print()
+                    except Exception:
+                        pass
         else:
             repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
             idx, _, desc, info, is_auto = get_step_info(code)
             ok = run_single_step(client, json_mgr, code, desc, info, is_auto, quiet)
-            if ok and not getattr(json_mgr, "transient", False) and not (json_mgr.data.get("account") or {}).get("phone"):
-                _, _, bdesc, binfo, _ = get_step_info("B1")
-                repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
-                run_single_step(client, json_mgr, "B1", bdesc, binfo, True, quiet)
         if not ok:
             if not quiet:
                 time.sleep(3)
@@ -998,10 +1005,6 @@ def portal_hub_loop(client, json_mgr, is_restored):
                 if not _ok:
                     _countdown()
                     continue
-            if not (json_mgr.data.get('account') or {}).get('phone', ''):
-                _, _, _bdesc, _binfo, _ = get_step_info('B1')
-                repaint_for_work(lambda: portal_show_hub_header(json_mgr))
-                portal_run_single_step(client, json_mgr, 'B1', _bdesc, _binfo, True)
             while True:
                 next_code = get_next_pending_step(json_mgr, cat_codes)
                 if next_code is None:
