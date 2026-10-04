@@ -74,7 +74,10 @@ from core.ui_cli import (
     paint_header,
     paint_prompt,
     paint_rows,
+    paint_work_head,
     progress_bar,
+    repaint_for_work,
+    start_work_frame,
 )
 from core.resolve import (
     resolve_episode,
@@ -137,7 +140,7 @@ def _fail_reason(s):
     return None
 
 
-def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
+def _select_paginated(items, title, header_line, row_fmt_fn, page_size=15):
     """Paged browse where choosing a number returns that item, or None on Back.
     Rows are numbered with their real position in the list (like the resolver)."""
     total = len(items)
@@ -188,7 +191,9 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
             return None
         _fresh_session_file(portal, mac)
         _register_new_portal(portal, mac)
-        return (portal, mac)
+        _mgr = JSONManager(portal, mac)
+        _mgr.set_meta(portal, mac)
+        return "NEW"
 
     while True:
         _paint_list()
@@ -197,9 +202,7 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
         if choice == "Q":
             return None
         elif choice == "N":
-            res = _inline_new_session()
-            if res:
-                return ("DIRECT", res[0], res[1])
+            _inline_new_session()
             return "NEW"
         elif choice == "D":
             _bad = [s for s in items if _fail_reason(s)]
@@ -218,7 +221,46 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
         elif choice.isdigit():
             num = int(choice)
             if 1 <= num <= total:
-                return items[num - 1]
+                picked = items[num - 1]
+                if _session_meta(picked).get("check_status") is not None:
+                    _paint_list()
+                    print()
+                    print()
+                    ans = input("  Already scanned. do you want to Re-scan? [y/n] > ").strip().upper()
+                    print()
+                    if ans != "Y":
+                        return picked
+                _client = Mac2ListPortal(picked["portal"], picked["mac"])
+                _tmgr = JSONManager(picked["portal"], picked["mac"])
+                _tmgr.set_meta(picked["portal"], picked["mac"])
+                _clean_hub_memory(_tmgr)
+                clear_outcomes_memory(_tmgr)
+                _tmgr.set_transient(True)
+                def _frame():
+                    _paint_list()
+                try:
+                    hub_loop(_client, _tmgr, True, True, _frame)
+                    _qh = _health_status(_tmgr.data.get('_meta', {}))
+                    _qpass = _tmgr.is_done('A1') and _qh.endswith('%')
+                    _qm = _tmgr.data.get('_meta', {})
+                    _qr = ''
+                    if _qm.get('handshake_status') == 'failed':
+                        _qr = _qm.get('handshake_reason', '')
+                    elif _qm.get('check_status') == 'failed':
+                        _qr = _qm.get('check_reason', '')
+                    print()
+                    if _qpass:
+                        print('  -> [OK] quick scan complete.')
+                    elif _qr:
+                        print('  -> [!] quick scan stopped - {}.'.format(_qr))
+                    else:
+                        print('  -> [!] quick scan stopped.')
+                finally:
+                    _tmgr.set_transient(False)
+                persist_failures_only(
+                    picked["portal"], picked["mac"],
+                    _tmgr.data.get('_meta', {}))
+                return "NEW"
 
 
 def _select_restore_session(sessions):
@@ -294,7 +336,7 @@ def _empty_list_shell():
                 continue
             _fresh_session_file(portal, mac)
             _register_new_portal(portal, mac)
-            return ("DIRECT", portal, mac)
+            return "NEW"
 
 
 def run_resume_or_new():
@@ -307,11 +349,6 @@ def run_resume_or_new():
             outcome = _empty_list_shell()
             if outcome == "BACK":
                 return "BACK", None
-            if isinstance(outcome, tuple) and outcome[0] == "DIRECT":
-                _, portal, mac = outcome
-                sessions = _database_sessions()
-                idx = next((i + 1 for i, s in enumerate(sessions) if s["portal"] == portal and s["mac"] == mac), len(sessions))
-                return "DIRECT", (portal, mac, idx, len(sessions))
             continue
 
         picked, sessions = _select_restore_session(sessions)
@@ -321,11 +358,6 @@ def run_resume_or_new():
             return "FULL", sessions
         if picked == "NEW":
             continue
-        if isinstance(picked, tuple) and picked[0] == "DIRECT":
-            _, portal, mac = picked
-            sessions = _database_sessions()
-            idx = next((i + 1 for i, s in enumerate(sessions) if s["portal"] == portal and s["mac"] == mac), len(sessions))
-            return "DIRECT", (portal, mac, idx, len(sessions))
 
         idx = sessions.index(picked) + 1
         return "ONE", (picked["portal"], picked["mac"], idx, len(sessions))
@@ -342,9 +374,7 @@ _hub_pos = 0
 def run_hub_handshake(client, json_mgr, quiet=False):
     """Three screens: work, fresh menu plus pause, menu plus saved line."""
     _, _, desc, _, _ = get_step_info("A1")
-    print()
-    print("  Executing: A1 — {}".format(desc))
-    print()
+    paint_work_head("  Executing: A1 — {}".format(desc))
     success, _msg = run_handshake_step(client, json_mgr)
     if success:
         json_mgr.mark_done("A1")
@@ -386,7 +416,7 @@ def show_hub(json_mgr):
     return input().strip().upper()
 
 
-def hub_loop(client, json_mgr, is_restored, quiet=False):
+def hub_loop(client, json_mgr, is_restored, quiet=False, frame=None):
     """Main Hub loop: one Enter runs the full order automatically."""
     global _hub_pos
     _hub_pos = 0
@@ -414,21 +444,11 @@ def hub_loop(client, json_mgr, is_restored, quiet=False):
             json_mgr.save()
             reset_scrape_fail_reason()
             for next_code in ("C2", "C5", "C4"):
-                if not quiet:
-                    show_hub_header(json_mgr)
-                    print()
-                else:
-                    portal_show_hub_header(json_mgr)
-                    print()
+                repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
                 idx, _, desc, info, is_auto = get_step_info(next_code)
                 run_single_step(client, json_mgr, next_code, desc, info, is_auto, quiet)
         elif code == "VOD":
-            if not quiet:
-                show_hub_header(json_mgr)
-                print()
-            else:
-                portal_show_hub_header(json_mgr)
-                print()
+            repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
             idx, _, desc, info, is_auto = get_step_info("D1")
             run_single_step(client, json_mgr, "D1", desc, info, is_auto, quiet)
             meta = json_mgr.data.setdefault("_meta", {})
@@ -448,47 +468,22 @@ def hub_loop(client, json_mgr, is_restored, quiet=False):
             if both_zero:
                 ok = False
             else:
-                if not quiet:
-                    show_hub_header(json_mgr)
-                    print()
-                else:
-                    portal_show_hub_header(json_mgr)
-                    print()
+                repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
                 idx, _, desc, info, is_auto = get_step_info("D4")
                 run_single_step(client, json_mgr, "D4", desc, info, is_auto, quiet)
-                if not quiet:
-                    show_hub_header(json_mgr)
-                    print()
-                else:
-                    portal_show_hub_header(json_mgr)
-                    print()
+                repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
                 idx, _, desc, info, is_auto = get_step_info("D3")
                 run_single_step(client, json_mgr, "D3", desc, info, is_auto, quiet)
         elif code == "CHECK":
-            if not quiet:
-                show_hub_header(json_mgr)
-                print()
-            else:
-                portal_show_hub_header(json_mgr)
-                print()
+            repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
             ok = run_single_step(client, json_mgr, "CHK", "Health Checker", "", False, quiet)
         else:
-            if not quiet:
-                show_hub_header(json_mgr)
-                print()
-            else:
-                portal_show_hub_header(json_mgr)
-                print()
+            repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
             idx, _, desc, info, is_auto = get_step_info(code)
             ok = run_single_step(client, json_mgr, code, desc, info, is_auto, quiet)
             if ok and not getattr(json_mgr, "transient", False) and not (json_mgr.data.get("account") or {}).get("phone"):
                 _, _, bdesc, binfo, _ = get_step_info("B1")
-                if not quiet:
-                    show_hub_header(json_mgr)
-                    print()
-                else:
-                    portal_show_hub_header(json_mgr)
-                    print()
+                repaint_for_work(lambda: show_hub_header(json_mgr), frame=frame, quiet=quiet)
                 run_single_step(client, json_mgr, "B1", bdesc, binfo, True, quiet)
         if not ok:
             if not quiet:
@@ -503,15 +498,13 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto, quiet=False):
     """Execute a single step. Screen shell around core run_step_work."""
     if code == "A1":
         return run_hub_handshake(client, json_mgr, quiet)
-    print()
-    print("  Executing: {} — {}".format(code, desc))
-    print()
+    paint_work_head("  Executing: {} — {}".format(code, desc))
 
     def _probe_bar(cur, total):
         progress_bar(cur, total, prefix="  Loading Categories: ")
 
     def _fetch_bar(done, total):
-        line = "  -> Fetching: [{}/{}] done".format(done, total)
+        line = "  -> Fetching: [{}/{}]".format(done, total)
         sys.stdout.write(chr(13) + line.ljust(80))
         sys.stdout.flush()
         time.sleep(0.1)
@@ -558,7 +551,7 @@ def run_single_step(client, json_mgr, code, desc, info, is_auto, quiet=False):
 # ============================================================
 # PORTAL SCREENS (inlined from mac2list-portal.py, prefixed)
 # ============================================================
-def portal__paged_picker(title, prepare, name_fn, right_fn, right_label, all_done_line, action_word, divider_label=None, with_failed=False, id_fn=None, page_size=20, start_page=0, header_total_fn=None):
+def portal__paged_picker(title, prepare, name_fn, right_fn, right_label, all_done_line, action_word,     divider_label=None, with_failed=False, id_fn=None, page_size=15, start_page=0, header_total_fn=None):
     """Interactive paginated pending-first picker, shared by menus 1-4.
 
     prepare() -> (items, pending_count, fetched_count); items must already be
@@ -674,7 +667,7 @@ def portal_batch_fetch_section(client, json_mgr, section):
                     retry_queue.append((p_template, failed_pages, cid, section))
             else:
                 fail_count += 1
-            line = '  Fetching: [{}/{}] done'.format(i + 1, len(to_fetch))
+            line = '  Fetching: [{}/{}]'.format(i + 1, len(to_fetch))
             if total_failed_pages:
                 line += '  |  {} pages failed'.format(total_failed_pages)
             sys.stdout.write(chr(13) + line.ljust(80))
@@ -966,25 +959,19 @@ def portal_show_hub(json_mgr):
     portal_show_hub_header(json_mgr)
     return input().strip().upper()
 
-def portal_hub_loop(client, json_mgr, is_restored, first_choice=None):
+def portal_hub_loop(client, json_mgr, is_restored):
     """Main Hub loop."""
     global _hub_full, _hub_pos
-    first = first_choice
     while True:
-        if first is not None:
-            choice, first = first, None
-        else:
-            choice = portal_show_hub(json_mgr)
+        choice = portal_show_hub(json_mgr)
         if choice == 'B':
             break
         elif choice == '1':
-            portal_show_hub_header(json_mgr)
-            print()
+            repaint_for_work(lambda: portal_show_hub_header(json_mgr))
             cat_codes = ['C2', 'D1', 'E1']
             all_done = all((json_mgr.is_done(c) for c in cat_codes))
             if all_done:
-                portal_show_hub_header(json_mgr)
-                print()
+                repaint_for_work(lambda: portal_show_hub_header(json_mgr))
                 print()
                 ans = input('  Provider Already scraped. do you want to Re-scrape? [y/n] > ').strip().upper()
                 if ans != 'Y':
@@ -997,49 +984,10 @@ def portal_hub_loop(client, json_mgr, is_restored, first_choice=None):
                             json_mgr.data['_meta']['done_steps'] = done
                 json_mgr.data['_meta']['scraped_at'] = ''
                 json_mgr.save()
-            _quick = input('\n  do you want to scan the health of your provider before scraping?  [y/n] > ').strip().upper()
-            print()
-            if _quick in ('', 'Y'):
-                _m0 = json_mgr.data.get('_meta', {})
-                _tmgr = JSONManager(_m0.get('portal', ''), _m0.get('mac', ''))
-                _clean_hub_memory(_tmgr)
-                clear_outcomes_memory(_tmgr)
-                _tmgr.set_transient(True)
-                try:
-                    _hub_full = False
-                    _hub_pos = 0
-                    hub_loop(client, _tmgr, True, True)
-                    _qh = _health_status(_tmgr.data.get('_meta', {}))
-                    _qpass = _tmgr.is_done('A1') and _qh.endswith('%')
-                    _qm = _tmgr.data.get('_meta', {})
-                    _qr = ''
-                    if _qm.get('handshake_status') == 'failed':
-                        _qr = _qm.get('handshake_reason', '')
-                    elif _qm.get('check_status') == 'failed':
-                        _qr = _qm.get('check_reason', '')
-                    print()
-                    if _qpass:
-                        print('  -> [OK] quick scan complete.')
-                    elif _qr:
-                        print('  -> [!] quick scan stopped - {}.'.format(_qr))
-                    else:
-                        print('  -> [!] quick scan stopped.')
-                finally:
-                    _tmgr.set_transient(False)
-                _real = persist_failures_only(
-                    _m0.get('portal', ''), _m0.get('mac', ''),
-                    _tmgr.data.get('_meta', {}))
-                sync_outer_meta(json_mgr.data.setdefault('_meta', {}),
-                                _real.data.get('_meta', {}))
-                if not _qpass:
-                    break
             if not json_mgr.is_done('A1'):
-                portal_show_hub_header(json_mgr)
-                print()
                 _, _, _desc, _, _ = get_step_info('A1')
-                print()
-                print('  Executing: A1 — {}'.format(_desc))
-                print()
+                start_work_frame(lambda: portal_show_hub_header(json_mgr),
+                                 '  Executing: A1 — {}'.format(_desc))
                 _ok, _msg = run_handshake_step(client, json_mgr)
                 print(_msg)
                 if _ok:
@@ -1052,14 +1000,13 @@ def portal_hub_loop(client, json_mgr, is_restored, first_choice=None):
                     continue
             if not (json_mgr.data.get('account') or {}).get('phone', ''):
                 _, _, _bdesc, _binfo, _ = get_step_info('B1')
-                portal_show_hub_header(json_mgr)
-                print()
+                repaint_for_work(lambda: portal_show_hub_header(json_mgr))
                 portal_run_single_step(client, json_mgr, 'B1', _bdesc, _binfo, True)
             while True:
                 next_code = get_next_pending_step(json_mgr, cat_codes)
                 if next_code is None:
                     break
-                portal_show_hub_header(json_mgr)
+                repaint_for_work(lambda: portal_show_hub_header(json_mgr))
                 idx, _, desc, info, is_auto = get_step_info(next_code)
                 portal_run_single_step(client, json_mgr, next_code, desc, info, is_auto)
         elif choice == '2':
@@ -1093,7 +1040,8 @@ def portal_run_section_submenu(client, json_mgr, sec_key, skip=None):
         skip = []
     sec = SECTIONS[sec_key]
     visible_items = [(c, d, i, a) for c, d, i, a in sec['items'] if c not in skip]
-    while True:
+
+    def _paint_section():
         clear_screen()
         if sec_key == 'Live Channels':
             paint_header('Mac2List Advanced v1.2 — Live Channels')
@@ -1107,12 +1055,16 @@ def portal_run_section_submenu(client, json_mgr, sec_key, skip=None):
             paint_footer('  [1-{}] Pick step  |  [B] Back'.format(len(visible_items)))
         else:
             paint_footer('  [1] Pick step  |  [B] Back')
+
+    while True:
+        _paint_section()
         choice = input().strip().upper()
         if choice == 'B':
             break
         elif choice.isdigit() and 1 <= int(choice) <= len(visible_items):
             code = visible_items[int(choice) - 1][0]
             idx, _, desc, info, is_auto = get_step_info(code)
+            repaint_for_work(_paint_section)
             portal_run_single_step(client, json_mgr, code, desc, info, is_auto)
         else:
             print('  Invalid choice.')
@@ -1204,10 +1156,7 @@ def portal_run_watch_submenu(json_mgr):
 
 def portal_run_single_step(client, json_mgr, code, desc, info, is_auto):
     """Execute a single step. Returns to caller when done."""
-    print()
-    print()
-    print('  Executing: {} — {}'.format(code, desc))
-    print()
+    paint_work_head('  Executing: {} — {}'.format(code, desc))
     success = False
     step_msg = ''
     if is_auto:
@@ -1264,7 +1213,7 @@ def portal_get_vlc_path(json_mgr):
     json_mgr.save()
     return path
 
-def portal_paginated_browse(items, title, headers, row_fmt_fn, page_size=20, get_urls_fn=None, vlc_path=None):
+def portal_paginated_browse(items, title, headers, row_fmt_fn, page_size=15, get_urls_fn=None, vlc_path=None):
     """Generic paginated read-only browser."""
     total = len(items)
     if total == 0:
@@ -1413,14 +1362,14 @@ def _run_one(portal, mac, idx, total):
     hub_loop(client, json_mgr, True)
 
 
-def _run_one_portal(portal, mac, first_choice=None):
+def _run_one_portal(portal, mac):
     """Open one portal in the portal hub: handshake already ran on the list."""
     json_mgr = JSONManager(portal, mac)
     meta = json_mgr.data.setdefault("_meta", {})
     if not meta.get("portal") or not meta.get("mac"):
         json_mgr.set_meta(portal, mac)
     client = Mac2ListPortal(portal, mac)
-    portal_hub_loop(client, json_mgr, True, first_choice)
+    portal_hub_loop(client, json_mgr, True)
 
 
 def main():
@@ -1436,10 +1385,6 @@ def main():
                 _hub_full = True
                 _run_one(session["portal"], session["mac"], i + 1, len(todo))
             _hub_full = False
-        elif mode == "DIRECT":
-            _hub_full = False
-            portal, mac, idx, total = payload
-            _run_one_portal(portal, mac, first_choice='1')
         else:
             _hub_full = False
             portal, mac, idx, total = payload

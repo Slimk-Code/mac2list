@@ -401,6 +401,8 @@ def persist_failures_only(portal, mac, post_meta):
     _STRIP = tuple(k for k in OUTCOME_STATUS_KEYS if not k.startswith("handshake"))
     real = JSONManager(portal, mac)
     rmeta = real.data.setdefault("_meta", {})
+    rmeta["portal"] = portal
+    rmeta["mac"] = mac
     for key in _STRIP:
         rmeta.pop(key, None)
         rmeta.pop(key[:-len("_status")] + "_reason", None)

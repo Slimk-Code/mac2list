@@ -55,11 +55,38 @@ def paint_prompt(label):
 
 
 def paint_work_head(exec_line):
-    """Print the work block opener: marker, gap, executing line, gap."""
-    print("  > ")
+    """Print the work block opener: gap, executing line, gap (no extra >)."""
     print()
     print(exec_line)
     print()
+
+
+def repaint_for_work(header_fn, frame=None, quiet=False):
+    """Unique clear + repaint + blank-line-below-> frame.
+
+    Non-quiet: clear_screen() + header_fn() + one blank print().
+    Quiet (Scan #): frame() when given, else a single print().
+    The caller then runs one step at a time.
+    """
+    if quiet:
+        if frame is not None:
+            frame()
+            print()
+        else:
+            print()
+    else:
+        header_fn()
+        print()
+
+
+def start_work_frame(header_fn, exec_line, frame=None, quiet=False):
+    """One call doing the full scrape-1 opener: repaint + work head.
+
+    Covers clear + repaint + blank-line-below-> + Executing line.
+    Call it once per step inside a one-at-a-time loop.
+    """
+    repaint_for_work(header_fn, frame=frame, quiet=quiet)
+    paint_work_head(exec_line)
 
 
 def clear_screen():
