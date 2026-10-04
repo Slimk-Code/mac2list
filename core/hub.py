@@ -93,6 +93,7 @@ def run_handshake_step(client, json_mgr):
                                 result.get("_error"), result.get("_lockedpath"), cache=cache)
         meta["handshake_status"] = "failed"
         meta["handshake_reason"] = handshake_reason(result)
+        (json_mgr.data.get("account") or {}).pop("phone", None)
         json_mgr.save()
         return False, "  -> [!] Handshake failed — no token. Saved error to {}".format(fname)
     save_json(result.get("_data"), "A1", "handshake", cache=cache)

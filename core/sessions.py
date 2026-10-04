@@ -170,6 +170,59 @@ def register_xtream(portal, username, password=""):
     _write_json(DATABASE_FILE, data)
 
 
+def delete_entries(entries, app="mac"):
+    """Remove database entries and their session files. Returns deleted count.
+
+    Only groups of *app* are touched; empty groups are dropped."""
+    entries = list(entries or [])
+    if not entries:
+        return 0
+    data = _read_json(DATABASE_FILE)
+    if not data or not isinstance(data, dict):
+        data = {"portals": []}
+    portals = data.get("portals")
+    if not isinstance(portals, list):
+        portals = []
+        data["portals"] = portals
+    gone = 0
+    for e in entries:
+        portal = (e.get("portal") or "")
+        mac = (e.get("mac") or "")
+        if not portal or not mac:
+            continue
+        for group in portals:
+            if not isinstance(group, dict) or group.get("portal") != portal:
+                continue
+            if _group_type(group) != app:
+                continue
+            if app == "xtream":
+                users = group.get("users")
+                if isinstance(users, list):
+                    before = len(users)
+                    users[:] = [u for u in users
+                                if not (isinstance(u, dict) and u.get("username") == mac)]
+                    gone += before - len(users)
+            else:
+                macs = group.get("macs")
+                if isinstance(macs, list) and mac in macs:
+                    macs.remove(mac)
+                    gone += 1
+        try:
+            spath = os.path.join(SESSION_DIR, make_session_id(portal, mac) + ".json")
+            if os.path.exists(spath):
+                os.remove(spath)
+        except Exception:
+            pass
+    portals[:] = [g for g in portals
+                  if not isinstance(g, dict)
+                  or g.get("portal")
+                  and (g.get("macs") or g.get("users")
+                       or g.get("active_mac") or g.get("pending_macs")
+                       or g.get("Archive_mac"))]
+    _write_json(DATABASE_FILE, data)
+    return gone
+
+
 def cleanup_orphans(entries):
     """Delete every saved session file (and its cache folder) whose portal+MAC
     is not listed in the database. The database is the main source; nothing in

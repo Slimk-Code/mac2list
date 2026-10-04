@@ -533,6 +533,8 @@ def save_step_outcome(json_mgr, key, ok, reason=""):
         meta[key + "_reason"] = reason
     else:
         meta.pop(key + "_reason", None)
+    if not ok:
+        (json_mgr.data.get("account") or {}).pop("phone", None)
     json_mgr.save()
 
 

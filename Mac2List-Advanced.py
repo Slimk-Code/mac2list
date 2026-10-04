@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime as _datetime
 
 import core.hub as _core_hub
 from core.config import (
@@ -81,6 +82,7 @@ from core.resolve import (
 from core.sessions import (
     cleanup_orphans as _cleanup_orphans,
     database_sessions as _database_sessions,
+    delete_entries as _delete_entries,
     make_session_id,
 )
 from core.status import (
@@ -116,6 +118,25 @@ from core.watch import (
 # ============================================================
 # PAGE 1 — RESTORE SESSION VIEWER (paged, pick one)
 # ============================================================
+def _fail_reason(s):
+    """Failure text for a session entry, or None when healthy/fresh.
+
+    Failure wins over any stale date; expired counts as failure."""
+    _st = _portal_status(s)
+    if _st == "-":
+        return None
+    if (_st.startswith("HTTP") or _st in ("timeout", "No channel", "No category", "Broken data")
+            or _st.startswith("Handshake -")):
+        return _st
+    try:
+        _exp = _datetime.strptime(str(s.get("phone", "")).strip(), "%B %d, %Y, %I:%M %p")
+    except Exception:
+        return None
+    if _exp < _datetime.now():
+        return "expired"
+    return None
+
+
 def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
     """Paged browse where choosing a number returns that item, or None on Back.
     Rows are numbered with their real position in the list (like the resolver)."""
@@ -135,9 +156,9 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
         paint_rows([row_fmt_fn(items[i], i + 1) for i in range(start, end)])
 
         if max_page > 0:
-            paint_footer("  [Enter] Next page  |  [1-{}] Scan #  |  [N] New session  |  [Q] Quit".format(total))
+            paint_footer("  [Enter] Next page  |  [1-{}] Scan #  |  [N] New session  |  [D] Delete  |  [Q] Quit".format(total))
         else:
-            paint_footer("  [1-{}] Scan #  |  [N] New session  |  [Q] Quit".format(total))
+            paint_footer("  [1-{}] Scan #  |  [N] New session  |  [D] Delete  |  [Q] Quit".format(total))
 
     def _inline_new_session():
         """Portal + MAC prompts below a fresh list repaint."""
@@ -180,6 +201,18 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=20):
             if res:
                 return ("DIRECT", res[0], res[1])
             return "NEW"
+        elif choice == "D":
+            _bad = [s for s in items if _fail_reason(s)]
+            if not _bad:
+                print()
+                print("  Nothing to delete - all sessions healthy.")
+                _cooldown(2)
+                return "NEW"
+            print()
+            ans = input("  Delete {} session(s) (expired/failed)? [y/n] > ".format(len(_bad))).strip().upper()
+            if ans == "Y":
+                _delete_entries(_bad)
+            return "NEW"
         elif choice == "" and max_page > 0:
             page = (page + 1) % (max_page + 1)
         elif choice.isdigit():
@@ -198,17 +231,21 @@ def _select_restore_session(sessions):
     header_line = "  {:<4}{:<8}{:<24}{:<20}{}".format("#", "Health", "Portal", "MAC", "Expiry")
 
     def row_fmt(s, idx):
-        _h = _health_status(_session_meta(s))
-        badge = _h if _h.endswith('%') else '-'
+        _err = _fail_reason(s)
+        if _err:
+            badge, status = "[!]", _err
+        else:
+            _h = _health_status(_session_meta(s))
+            badge = _h if _h.endswith('%') else '-'
+            expiry = _expiry_label(s.get("phone", ""))
+            if expiry:
+                status = expiry
+            elif _portal_status(s) == "-":
+                status = "-"
+            else:
+                status = "unknown"
         portal = _domain_of(s.get("portal", ""))[:24]
         mac = str(s.get("mac", ""))[:19]
-        expiry = _expiry_label(s.get("phone", ""))
-        if expiry:
-            status = expiry
-        elif _portal_status(s) == "-":
-            status = "-"
-        else:
-            status = "unknown"
         return "  {:<4}{:<8}{:<24}{:<20}{}".format(idx, badge, portal, mac, status)
 
     sessions = sorted(sessions, key=_portal_rank)
