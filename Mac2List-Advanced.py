@@ -159,9 +159,9 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=15):
         paint_rows([row_fmt_fn(items[i], i + 1) for i in range(start, end)])
 
         if max_page > 0:
-            paint_footer("  [Enter] Next page  |  [1-{}] Scan #  |  [N] New session  |  [D] Delete  |  [Q] Quit".format(total))
+            paint_footer("  [Enter] Next page  |  [1-{}] Scan #  |  [N] New session  |  [Q] Quit".format(total))
         else:
-            paint_footer("  [1-{}] Scan #  |  [N] New session  |  [D] Delete  |  [Q] Quit".format(total))
+            paint_footer("  [1-{}] Scan #  |  [N] New session  |  [Q] Quit".format(total))
 
     def _inline_new_session():
         """Portal + MAC prompts below a fresh list repaint."""
@@ -204,57 +204,62 @@ def _select_paginated(items, title, header_line, row_fmt_fn, page_size=15):
         elif choice == "N":
             _inline_new_session()
             return "NEW"
-        elif choice == "D":
-            _bad = [s for s in items if _fail_reason(s)]
-            if not _bad:
-                print()
-                print("  Nothing to delete - all sessions healthy.")
-                _cooldown(2)
-                return "NEW"
-            print()
-            ans = input("  Delete {} session(s) (expired/failed)? [y/n] > ".format(len(_bad))).strip().upper()
-            if ans == "Y":
-                _delete_entries(_bad)
-            return "NEW"
         elif choice == "" and max_page > 0:
             page = (page + 1) % (max_page + 1)
         elif choice.isdigit():
             num = int(choice)
             if 1 <= num <= total:
                 picked = items[num - 1]
-                if _session_meta(picked).get("check_status") is not None:
-                    return picked
-                _client = Mac2ListPortal(picked["portal"], picked["mac"])
-                _tmgr = JSONManager(picked["portal"], picked["mac"])
-                _tmgr.set_meta(picked["portal"], picked["mac"])
-                _clean_hub_memory(_tmgr)
-                clear_outcomes_memory(_tmgr)
-                _tmgr.set_transient(True)
-                def _frame():
+
+                def _quick_scan(target):
+                    _client = Mac2ListPortal(target["portal"], target["mac"])
+                    _tmgr = JSONManager(target["portal"], target["mac"])
+                    _tmgr.set_meta(target["portal"], target["mac"])
+                    _clean_hub_memory(_tmgr)
+                    clear_outcomes_memory(_tmgr)
+                    _tmgr.set_transient(True)
+
+                    def _frame():
+                        _paint_list()
+                    try:
+                        hub_loop(_client, _tmgr, True, True, _frame)
+                        _qh = _health_status(_tmgr.data.get('_meta', {}))
+                        _qpass = _tmgr.is_done('A1') and _qh.endswith('%')
+                        _qm = _tmgr.data.get('_meta', {})
+                        _qr = ''
+                        if _qm.get('handshake_status') == 'failed':
+                            _qr = _qm.get('handshake_reason', '')
+                        elif _qm.get('check_status') == 'failed':
+                            _qr = _qm.get('check_reason', '')
+                        print()
+                        if _qpass:
+                            print('  -> [OK] quick scan complete.')
+                        elif _qr:
+                            print('  -> [!] quick scan stopped - {}.'.format(_qr))
+                        else:
+                            print('  -> [!] quick scan stopped.')
+                    finally:
+                        _tmgr.set_transient(False)
+                    persist_failures_only(
+                        target["portal"], target["mac"],
+                        _tmgr.data.get('_meta', {}))
+                    return "NEW"
+
+                if _fail_reason(picked) is not None:
                     _paint_list()
-                try:
-                    hub_loop(_client, _tmgr, True, True, _frame)
-                    _qh = _health_status(_tmgr.data.get('_meta', {}))
-                    _qpass = _tmgr.is_done('A1') and _qh.endswith('%')
-                    _qm = _tmgr.data.get('_meta', {})
-                    _qr = ''
-                    if _qm.get('handshake_status') == 'failed':
-                        _qr = _qm.get('handshake_reason', '')
-                    elif _qm.get('check_status') == 'failed':
-                        _qr = _qm.get('check_reason', '')
                     print()
-                    if _qpass:
-                        print('  -> [OK] quick scan complete.')
-                    elif _qr:
-                        print('  -> [!] quick scan stopped - {}.'.format(_qr))
-                    else:
-                        print('  -> [!] quick scan stopped.')
-                finally:
-                    _tmgr.set_transient(False)
-                persist_failures_only(
-                    picked["portal"], picked["mac"],
-                    _tmgr.data.get('_meta', {}))
-                return "NEW"
+                    print()
+                    ans = input("  your Provider is not working, [D]elete / [R]escan > ").strip().upper()
+                    print()
+                    if ans == "R":
+                        return _quick_scan(picked)
+                    if ans == "D":
+                        _delete_entries([picked])
+                        return "NEW"
+                    return "NEW"
+                if _session_meta(picked).get("check_status") is None:
+                    return _quick_scan(picked)
+                return picked
 
 
 def _select_restore_session(sessions):
